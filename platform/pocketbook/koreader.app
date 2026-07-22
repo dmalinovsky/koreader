@@ -1,8 +1,19 @@
 #!/bin/sh
+
 export LC_ALL="en_US.UTF-8"
 
-# working directory of koreader
-KOREADER_DIR="/mnt/ext1/applications/koreader"
+UNPACK_DIR='/mnt/ext1'
+# KOReader's working directory.
+KOREADER_DIR="${UNPACK_DIR}/applications/koreader"
+
+# Relocalize ourselves to /tmp: this is used by KOReader to detect if the
+# original script has changed after an update (requiring a complete restart
+# from the parent launcher).
+if [ "$(dirname "${0}")" != '/tmp' ]; then
+    cp -pf "${0}" '/tmp/koreader.app'
+    chmod 777 '/tmp/koreader.app'
+    exec '/tmp/koreader.app' "$@"
+fi
 
 # load our own shared libraries if possible, solely because we don't control InkView, and we'd rather not it have load duplicate system libs...
 # (We handle this via DT_RPATH for our own stuff).
@@ -15,7 +26,7 @@ export KO_PATH_OPEN_BOOK="/tmp/.koreader.open"
 INSTANCE_PID=$(cat /tmp/koreader.pid 2>/dev/null)
 if [ "${INSTANCE_PID}" != "" ] && [ -e "/proc/${INSTANCE_PID}" ]; then
     echo "$@" >"${KO_PATH_OPEN_BOOK}"
-    exec /usr/bin/iv2sh SetActiveTask "${INSTANCE_PID}" 0
+    exec $(if [ -f "/usr/bin/iv2sh" ]; then echo /usr/bin/iv2sh; else echo /ebrmain/bin/iv2sh; fi) SetActiveTask "${INSTANCE_PID}" 0
 fi
 
 # try to bring in raw device input (on rooted devices)
@@ -30,6 +41,8 @@ ko_update_check() {
     INSTALLED="${KOREADER_DIR}/ota/koreader.installed.tar"
     if [ -f "${NEWUPDATE}" ]; then
         "${KOREADER_DIR}/fbink" -q -y -7 -pmh "Updating KOReader"
+        # Keep a copy of the old manifest for cleaning leftovers later.
+        sed 's,^../,,' "${KOREADER_DIR}/ota/package.index" >/tmp/package.index.old
         # Setup the FBInk daemon
         export FBINK_NAMED_PIPE="/tmp/.koreader.fbink"
         rm -f "${FBINK_NAMED_PIPE}"
@@ -60,6 +73,9 @@ ko_update_check() {
         # Cleanup behind us...
         if [ "${fail}" -eq 0 ]; then
             mv "${NEWUPDATE}" "${INSTALLED}"
+            # Cleanup leftovers from previous install.
+            sed 's,^../,,' "${KOREADER_DIR}/ota/package.index" >/tmp/package.index.new
+            (cd "${UNPACK_DIR}" && grep -xvFf /tmp/package.index.new /tmp/package.index.old | xargs -r rm -vf)
             "${KOREADER_DIR}/fbink" -q -y -6 -pm "Update successful :)"
             "${KOREADER_DIR}/fbink" -q -y -5 -pm "KOReader will start momentarily . . ."
         else
@@ -67,7 +83,7 @@ ko_update_check() {
             "${KOREADER_DIR}/fbink" -q -y -6 -pmh "Update failed :("
             "${KOREADER_DIR}/fbink" -q -y -5 -pm "KOReader may fail to function properly!"
         fi
-        rm -f "${NEWUPDATE}" # always purge newupdate to prevent update loops
+        rm -f /tmp/package.index.old /tmp/package.index.new "${NEWUPDATE}" # always purge newupdate to prevent update loops
         unset CPOINTS FBINK_NAMED_PIPE
         unset BLOCKS FILESIZE FBINK_PID
         # Ensure everything is flushed to disk before we restart. This *will* stall for a while on slow storage!
@@ -77,9 +93,6 @@ ko_update_check() {
 
 # we're always starting from our working directory
 cd ${KOREADER_DIR} || exit
-
-# export trained OCR data directory
-export TESSDATA_PREFIX="data"
 
 # export dict directory
 export STARDICT_DATA_DIR="data/dict"
@@ -121,7 +134,7 @@ while [ "${RETURN_VALUE}" -ne 0 ]; do
     if [ "${RETURN_VALUE}" -ne 0 ] && [ "${RETURN_VALUE}" -ne ${KO_RC_RESTART} ]; then
         # Increment the crash counter
         # shellcheck disable=SC2003
-        CRASH_COUNT="$(expr ${CRASH_COUNT} + 1)"
+        CRASH_COUNT="$(expr "${CRASH_COUNT}" + 1)"
         CRASH_TS="$(date +'%s')"
         # Reset it to a first crash if it's been a while since our last crash...
         # shellcheck disable=SC2003
@@ -151,7 +164,7 @@ while [ "${RETURN_VALUE}" -ne 0 ]; do
         bombMargin="$(expr ${FONTH} + ${FONTH} / 2)"
         # With a little notice at the top of the screen, on a big gray screen of death ;).
         "${KOREADER_DIR}/fbink" -q -b -c -B GRAY9 -m -y 1 "Don't Panic! (Crash n°${CRASH_COUNT} -> ${RETURN_VALUE})"
-        if [ ${CRASH_COUNT} -eq 1 ]; then
+        if [ "${CRASH_COUNT}" -eq 1 ]; then
             # Warn that we're sleeping for a bit...
             "${KOREADER_DIR}/fbink" -q -b -O -m -y 2 "KOReader will restart in 15 sec."
         fi
@@ -171,13 +184,13 @@ while [ "${RETURN_VALUE}" -ne 0 ]; do
             echo "!!!!"
             echo "Uh oh, something went awry... (Crash n°${CRASH_COUNT}: $(date +'%x @ %X'))"
         } >>crash.log 2>&1
-        if [ ${CRASH_COUNT} -lt 5 ] && [ "${ALWAYS_ABORT}" = "false" ]; then
+        if [ "${CRASH_COUNT}" -lt 5 ] && [ "${ALWAYS_ABORT}" = "false" ]; then
             echo "Attempting to restart KOReader . . ." >>crash.log 2>&1
             echo "!!!!" >>crash.log 2>&1
         fi
 
         # Pause a bit if it's the first crash in a while, so that it actually has a chance of getting noticed ;).
-        if [ ${CRASH_COUNT} -eq 1 ]; then
+        if [ "${CRASH_COUNT}" -eq 1 ]; then
             sleep 15
         fi
         # Cycle the last crash timestamp
@@ -185,7 +198,7 @@ while [ "${RETURN_VALUE}" -ne 0 ]; do
 
         # But if we've crashed more than 5 consecutive times, exit, because we wouldn't want to be stuck in a loop...
         # NOTE: No need to check for ALWAYS_ABORT, CRASH_COUNT will always be 1 when it's true ;).
-        if [ ${CRASH_COUNT} -ge 5 ]; then
+        if [ "${CRASH_COUNT}" -ge 5 ]; then
             echo "Too many consecutive crashes, aborting . . ." >>crash.log 2>&1
             echo "!!!! ! !!!!" >>crash.log 2>&1
             break

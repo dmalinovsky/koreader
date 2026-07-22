@@ -6,26 +6,27 @@ local logger = require("logger")
 
 local db_location = DataStorage:getSettingsDir() .. "/vocabulary_builder.sqlite3"
 
-local DB_SCHEMA_VERSION = 20221002
+local DB_SCHEMA_VERSION = 20240905
 local VOCABULARY_DB_SCHEMA = [[
     -- To store looked up words
-    CREATE TABLE IF NOT EXISTS "vocabulary" (
-        "word"          TEXT NOT NULL UNIQUE,
-        "title_id"      INTEGER,
-        "create_time"   INTEGER NOT NULL,
-        "review_time"   INTEGER,
-        "due_time"      INTEGER NOT NULL,
-        "review_count"  INTEGER NOT NULL DEFAULT 0,
-        "prev_context"  TEXT,
-        "next_context"  TEXT,
-        "streak_count"  INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY("word")
+    CREATE TABLE IF NOT EXISTS vocabulary (
+        word          TEXT NOT NULL UNIQUE,
+        title_id      INTEGER,
+        create_time   INTEGER NOT NULL,
+        review_time   INTEGER,
+        due_time      INTEGER NOT NULL,
+        review_count  INTEGER NOT NULL DEFAULT 0,
+        prev_context  TEXT,
+        next_context  TEXT,
+        streak_count  INTEGER NOT NULL DEFAULT 0,
+        highlight     TEXT,
+        PRIMARY KEY(word)
     );
-    CREATE TABLE IF NOT EXISTS "title" (
-        "id"            INTEGER NOT NULL UNIQUE,
-        "name"          TEXT UNIQUE,
-        "filter"        INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY("id")
+    CREATE TABLE IF NOT EXISTS title (
+        id            INTEGER NOT NULL UNIQUE,
+        name          TEXT UNIQUE,
+        filter        INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY(id)
     );
     CREATE INDEX IF NOT EXISTS due_time_index ON vocabulary(due_time);
     CREATE INDEX IF NOT EXISTS title_name_index ON title(name);
@@ -96,6 +97,10 @@ function VocabularyBuilder:createDB()
             ok, re = pcall(db_conn.exec, db_conn, [[
                 ALTER TABLE vocabulary ADD streak_count INTEGER NULL DEFAULT 0;
                 UPDATE vocabulary SET streak_count = review_count; ]])
+            if not ok then log(re) end
+        end
+        if db_version < 20240905 then
+            ok, re = pcall(db_conn.exec, db_conn, "ALTER TABLE vocabulary ADD highlight TEXT;")
             if not ok then log(re) end
         end
 
@@ -170,6 +175,7 @@ function VocabularyBuilder:_select_items(items, start_idx, reload_time, search_t
             item.review_count = math.max(0, tonumber(results.review_count[i]))
             item.streak_count = math.max(0, tonumber(results.streak_count[i]))
             item.book_title = results.name[i] or ""
+            item.highlight = results.highlight[i]
             item.create_time = tonumber( results.create_time[i])
             item.review_time = nil --use this field to flag change
             item.due_time = tonumber(results.due_time[i])
@@ -278,20 +284,48 @@ function VocabularyBuilder:insertOrUpdate(entry)
     stmt:step()
     stmt:clearbind():reset()
 
-    stmt = conn:prepare([[INSERT INTO vocabulary (word, title_id, create_time, due_time, review_time, prev_context, next_context)
-                        VALUES (?, (SELECT id FROM title WHERE name = ?), ?, ?, ?, ?, ?)
+    stmt = conn:prepare([[INSERT INTO vocabulary (word, title_id, create_time, due_time, review_time, prev_context, next_context, highlight)
+                        VALUES (?, (SELECT id FROM title WHERE name = ?), ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(word) DO UPDATE SET title_id = excluded.title_id,
                         create_time = excluded.create_time,
                         review_count = MAX(review_count-1, 0),
                         streak_count = 0,
                         due_time = ?,
                         prev_context = ifnull(excluded.prev_context, prev_context),
-                        next_context = ifnull(excluded.next_context, next_context);]]);
+                        next_context = ifnull(excluded.next_context, next_context),
+                        highlight = ifnull(excluded.highlight, highlight);]]);
     stmt:bind(entry.word, entry.book_title, entry.time, entry.time+300, entry.time,
-              entry.prev_context, entry.next_context, entry.time+300)
+              entry.prev_context, entry.next_context, entry.highlight, entry.time+300)
     stmt:step()
     stmt:clearbind():reset()
     conn:close()
+end
+
+function VocabularyBuilder:hasWord(word)
+    local conn = SQ3.open(db_location)
+    local sql = [[SELECT title.name as book_title, vocabulary.word, create_time, review_time, due_time, review_count, streak_count, prev_context, next_context, highlight
+          FROM vocabulary INNER JOIN title ON title_id = title.id WHERE word = ?]]
+    local stmt = conn:prepare(sql)
+    stmt:bind(word)
+    local result = stmt:step()
+    stmt:close()
+    conn:close()
+    if result then
+        return {
+            book_title = result[1],
+            word = result[2],
+            create_time = tonumber(result[3]),
+            review_time = tonumber(result[4]),
+            due_time = tonumber(result[5]),
+            review_count = tonumber(result[6]),
+            streak_count = tonumber(result[7]),
+            prev_context = result[8],
+            next_context = result[9],
+            highlight = result[10],
+        }
+    else
+        return nil
+    end
 end
 
 function VocabularyBuilder:toggleBookFilter(ids)
@@ -393,8 +427,12 @@ function VocabularyBuilder.onSync(local_path, cached_path, income_path)
     if not ok1 or tonumber(v1) == 0 then
         -- no income db or wrong db, first time sync
         logger.dbg("vocabbuilder open income DB failed", v1)
+        conn_income:close()
         return true
     end
+
+    -- Handle possible inconsistensies in db version
+    pcall(conn_income.exec, conn_income, "ALTER TABLE vocabulary ADD highlight TEXT;")
 
     local sql = "attach '" .. income_path:gsub("'", "''") .."' as income_db;"
     -- then we try to open cached db
@@ -430,6 +468,7 @@ function VocabularyBuilder.onSync(local_path, cached_path, income_path)
     if not ok3 or tonumber(v3) == 0 then
         -- no local db, this is an error
         logger.err("vocabbuilder open local DB", v3)
+        conn:close()
         return false
     end
 
@@ -451,8 +490,8 @@ function VocabularyBuilder.onSync(local_path, cached_path, income_path)
 
         -- Then we merge the income_db's contents into the local db
         INSERT INTO vocabulary
-              (word, create_time, review_time, due_time, review_count, prev_context, next_context, title_id, streak_count)
-        SELECT word, create_time, review_time, due_time, review_count, prev_context, next_context, title_id, streak_count
+              (word, create_time, review_time, due_time, review_count, prev_context, next_context, title_id, streak_count, highlight)
+        SELECT word, create_time, review_time, due_time, review_count, prev_context, next_context, title_id, streak_count, highlight
         FROM income_db.vocabulary WHERE true
         ON CONFLICT(word) DO UPDATE SET
         due_time = MAX(due_time, excluded.due_time),
@@ -462,6 +501,7 @@ function VocabularyBuilder.onSync(local_path, cached_path, income_path)
         END,
         prev_context = ifnull(excluded.prev_context, prev_context),
         next_context = ifnull(excluded.next_context, next_context),
+        highlight = ifnull(excluded.highlight, highlight),
         streak_count = CASE
             WHEN review_time > excluded.review_time THEN streak_count
             ELSE excluded.streak_count

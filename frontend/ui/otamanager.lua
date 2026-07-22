@@ -13,6 +13,7 @@ local UIManager = require("ui/uimanager")
 local Version = require("version")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
+local util = require("util")
 local _ = require("gettext")
 local C_ = _.pgettext
 local T = require("ffi/util").template
@@ -49,81 +50,10 @@ local ota_channels = {
     nightly = _("Development"),
 }
 
--- Try to detect WARIO+ Kindle boards (i.MX6 & i.MX7)
-function OTAManager:_isKindleWarioOrMore()
-    local cpu_hw = nil
-    -- Parse cpuinfo line by line, until we find the Hardware description
-    for line in io.lines("/proc/cpuinfo") do
-        if line:find("^Hardware") then
-            cpu_hw = line:match("^Hardware%s*:%s([%g%s]*)$")
-        end
-    end
-    -- NOTE: I couldn't dig up a cpuinfo dump from an Oasis 2 to check the CPU part value,
-    --       but for Wario (Cortex A9), matching that to 0xc09 would work, too.
-    --       On the other hand, I'm already using the Hardware match in MRPI, so, that sealed the deal ;).
-
-    -- If we've got a Hardware string, check if it mentions an i.MX 6 or 7 or a MTK...
-    if cpu_hw then
-        if cpu_hw:find("i%.MX%s?[6-7]") or cpu_hw:find("MT8110") then
-            return true
-        else
-            return false
-        end
-    else
-        return false
-    end
-end
-
--- "x86", "x64", "arm", "arm64", "ppc", "mips" or "mips64".
-local arch = jit.arch
-
-function OTAManager:getOTAModel()
-    if Device:isAndroid() then
-        if arch == "arm64" then
-            return "android-arm64"
-        elseif arch == "x86" then
-            return "android-x86"
-        elseif arch == "x64" then
-            return "android-x86_64"
-        end
-        return "android"
-    elseif Device:isSDL() then
-        return "appimage"
-    elseif Device:isCervantes() then
-        return "cervantes"
-    elseif Device:isKindle() then
-        if Device:isTouchDevice() or Device.model == "Kindle4" then
-            if self:_isKindleWarioOrMore() then
-                return "kindlepw2"
-            else
-                return "kindle"
-            end
-        else
-            return "kindle-legacy"
-        end
-    elseif Device:isKobo() then
-        return "kobo"
-    elseif Device:isPocketBook() then
-        return "pocketbook"
-    elseif Device:isRemarkable() then
-        return "remarkable"
-    elseif Device:isSonyPRSTUX() then
-        return "sony-prstux"
-    else
-        return ""
-    end
-end
-
 function OTAManager:getOTAType()
-    local ota_model = self:getOTAModel()
-
-    if ota_model == "" then return end
-
-    if ota_model:find("android") or ota_model:find("appimage") then
-        return "link"
-    end
-
-    return "ota"
+    local platform, kind = Device:otaModel()
+    if not platform then return "none" end
+    return kind
 end
 
 function OTAManager:getOTAServer()
@@ -144,23 +74,33 @@ function OTAManager:setOTAChannel(channel)
     G_reader_settings:saveSetting("ota_channel", channel)
 end
 
-function OTAManager:getLinkFilename()
-    return self.link_template:format(self:getOTAModel(), self:getOTAChannel())
+function OTAManager:getFilename(kind)
+    if type(kind) ~= "string" then return end
+    local model = Device:otaModel()
+    local channel = self:getOTAChannel()
+    if kind == "ota" then
+        return self.zsync_template:format(model, channel)
+    elseif kind == "link" then
+        return self.link_template:format(model, channel)
+    end
 end
 
 function OTAManager:getZsyncFilename()
-    return self.zsync_template:format(self:getOTAModel(), self:getOTAChannel())
+    return self:getFilename("ota")
 end
 
 function OTAManager:checkUpdate()
     if Device:isDeprecated() then return -1 end
-
     local http = require("socket.http")
     local ltn12 = require("ltn12")
     local socket = require("socket")
     local socketutil = require("socketutil")
 
-    local update_file = (self:getOTAType() == "link") and self:getLinkFilename() or self:getZsyncFilename()
+    local update_kind = self:getOTAType()
+    if not update_kind then return -1 end
+
+    local update_file = self:getFilename(update_kind)
+    if not update_file then return -2 end
 
     local ota_update_file = self:getOTAServer() .. update_file
     local local_update_file = ota_dir .. update_file
@@ -232,6 +172,10 @@ function OTAManager:fetchAndProcessUpdate()
     elseif ota_version == -1 then
         UIManager:show(InfoMessage:new{
             text = T(_("Device no longer supported.\n\nPlease check %1"), "https://github.com/koreader/koreader/wiki/deprecated-devices")
+        })
+    elseif ota_version == -2 then
+        UIManager:show(InfoMessage:new{
+            text = _("Unable to determine OTA model.")
         })
     elseif ota_version == nil then
         UIManager:show(InfoMessage:new{
@@ -360,6 +304,15 @@ function OTAManager:_buildLocalPackage()
         return nil
     end
 
+    local tar_cmd = {
+        './tar',
+        '--create', '--file='..self.installed_package,
+        '--mtime', tostring(Version:getBuildDate()),
+        '--numeric-owner', '--owner=0', '--group=0',
+        '--ignore-failed-read', '--no-recursion', '-C', '..',
+        '--verbatim-files-from', '--files-from', self.package_indexfile,
+    }
+
     -- With visual feedback if supported...
     if self.can_pretty_print then
         os.execute("./fbink -q -y -7 -pmh 'Preparing local OTA package'")
@@ -385,23 +338,19 @@ function OTAManager:_buildLocalPackage()
         end
         -- And since we want a percentage, devise the exact value we need for tar to spit out exactly 100 checkpoints ;).
         local cpoints = blocks * (1/100)
-        return os.execute(string.format(
-            "./tar --no-recursion -cf %s -C .. -T %s --checkpoint=%d --checkpoint-action=exec='./fbink -q -y -6 -P $(($TAR_CHECKPOINT/%d))'",
-            self.installed_package, self.package_indexfile, cpoints, cpoints))
-    else
-        return os.execute(string.format(
-            "./tar --no-recursion -cf %s -C .. -T %s",
-            self.installed_package, self.package_indexfile))
+        table.insert(tar_cmd, string.format('--checkpoint=%d', cpoints))
+        table.insert(tar_cmd, string.format('--checkpoint-action=exec=./fbink -q -y -6 -P $(($TAR_CHECKPOINT/%d))', cpoints))
     end
+    return os.execute(util.shell_escape(tar_cmd))
 end
 
 function OTAManager:zsync(full_dl)
     if full_dl or self:_buildLocalPackage() == 0 then
-        local zsync_wrapper = "zsync2"
+        local zsync_wrapper = "./zsync2"
         local use_pipefail = true
         -- With visual feedback if supported...
         if self.can_pretty_print then
-            zsync_wrapper = "spinning_zsync"
+            zsync_wrapper = "./spinning_zsync"
             -- And because everything is terrible, we can't check for pipefail's usability in spinning_zsync,
             -- because older ash versions abort on set -o failures...
             -- c.f., ko/#5844
@@ -409,29 +358,26 @@ function OTAManager:zsync(full_dl)
             -- (remember, os.execute is essentially system(), it goes through sh)
             use_pipefail = (os.execute("set -o pipefail 2>/dev/null") == 0)
         end
-        -- If that's a full-download fallback, drop the input tarball
-        if full_dl then
-            return os.execute(
-            ("env WITH_PIPEFAIL='%s' ./%s -o '%s' -u '%s' '%s%s'"):format(
-                use_pipefail,
-                zsync_wrapper,
-                self.updated_package,
-                self:getOTAServer(),
-                ota_dir,
-                self:getZsyncFilename())
-            )
-        else
-            return os.execute(
-            ("env WITH_PIPEFAIL='%s' ./%s -i '%s' -o '%s' -u '%s' '%s%s'"):format(
-                use_pipefail,
-                zsync_wrapper,
-                self.installed_package,
-                self.updated_package,
-                self:getOTAServer(),
-                ota_dir,
-                self:getZsyncFilename())
-            )
+        local zsync_cmd = {
+            'env',
+            string.format('WITH_PIPEFAIL=%s', use_pipefail),
+        }
+        -- Honor HTTP proxy setting.
+        local http_proxy = G_reader_settings:readSetting("http_proxy")
+        if http_proxy then
+            table.insert(zsync_cmd, string.format("http_proxy=%s", http_proxy))
         end
+        table.insert(zsync_cmd, zsync_wrapper)
+        -- Only add input tarball when not doing a full download.
+        if not full_dl then
+            util.arrayAppend(zsync_cmd, {"-i", self.installed_package})
+        end
+        util.arrayAppend(zsync_cmd, {
+            "-o", self.updated_package,
+            "-u", self:getOTAServer(),
+            ota_dir .. self:getZsyncFilename(),
+        })
+        return os.execute(util.shell_escape(zsync_cmd))
     end
 end
 

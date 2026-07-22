@@ -3,15 +3,18 @@ This module contains miscellaneous helper functions for FileManager
 ]]
 
 local BD = require("ui/bidi")
+local BookList = require("ui/widget/booklist")
+local CheckButton = require("ui/widget/checkbutton")
+local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
 local DocSettings = require("docsettings")
 local Event = require("ui/event")
 local UIManager = require("ui/uimanager")
-local ffiutil = require("ffi/util")
+local ffiUtil = require("ffi/util")
 local lfs = require("libs/libkoreader-lfs")
 local util = require("util")
 local _ = require("gettext")
-local T = ffiutil.template
+local T = ffiUtil.template
 
 local filemanagerutil = {}
 
@@ -19,10 +22,14 @@ function filemanagerutil.getDefaultDir()
     return Device.home_dir or "."
 end
 
+function filemanagerutil.getHomeFolder()
+    return G_reader_settings:readSetting("home_dir") or Device.home_dir or "."
+end
+
 function filemanagerutil.abbreviate(path)
     if not path then return "" end
     if G_reader_settings:nilOrTrue("shorten_home_dir") then
-        local home_dir = G_reader_settings:readSetting("home_dir") or filemanagerutil.getDefaultDir()
+        local home_dir = filemanagerutil.getHomeFolder()
         if path == home_dir or path == home_dir .. "/" then
             return _("Home")
         end
@@ -50,39 +57,39 @@ function filemanagerutil.splitFileNameType(filepath)
     return filename_without_suffix, filetype
 end
 
-function filemanagerutil.getRandomFile(dir, match_func)
-    if not dir:match("/$") then
-        dir = dir .. "/"
-    end
+function filemanagerutil.getRandomFile(dir, match_func, max_files)
     local files = {}
-    local ok, iter, dir_obj = pcall(lfs.dir, dir)
-    if ok then
-        for entry in iter, dir_obj do
-            local file = dir .. entry
-            if lfs.attributes(file, "mode") == "file" and match_func(file) then
-                table.insert(files, entry)
-            end
+    util.findFiles(dir, function(file)
+        if match_func(file) then
+            table.insert(files, file)
         end
-        if #files > 0 then
-            math.randomseed(os.time())
-            return dir .. files[math.random(#files)]
-        end
+    end, false, max_files)
+    if #files > 0 then
+        math.randomseed(os.time())
+        return files[math.random(#files)]
     end
 end
 
 -- Purge doc settings except kept
 function filemanagerutil.resetDocumentSettings(file)
     local settings_to_keep = {
+        annotations = true,
+        annotations_paging = true,
+        annotations_rolling = true,
         bookmarks = true,
+        bookmarks_paging = true,
+        bookmarks_rolling = true,
         bookmarks_sorted_20220106 = true,
         bookmarks_version = true,
         cre_dom_version = true,
         highlight = true,
+        highlight_paging = true,
+        highlight_rolling = true,
         highlights_imported = true,
         last_page = true,
         last_xpointer = true,
     }
-    local file_abs_path = ffiutil.realpath(file)
+    local file_abs_path = ffiUtil.realpath(file)
     if file_abs_path then
         local doc_settings = DocSettings:open(file_abs_path)
         for k in pairs(doc_settings.data) do
@@ -92,45 +99,19 @@ function filemanagerutil.resetDocumentSettings(file)
         end
         doc_settings:makeTrue("docsettings_reset_done") -- for readertypeset block_rendering_mode
         doc_settings:flush()
+        BookList.setBookInfoCache(file_abs_path, doc_settings)
     end
 end
 
--- Get a document status ("new", "reading", "complete", or "abandoned")
-function filemanagerutil.getStatus(file)
-    if DocSettings:hasSidecarFile(file) then
-        local summary = DocSettings:open(file):readSetting("summary")
-        if summary and summary.status and summary.status ~= "" then
-            return summary.status
-        end
-        return "reading"
-    end
-    return "new"
-end
-
--- Set a document status ("reading", "complete", or "abandoned")
-function filemanagerutil.setStatus(doc_settings_or_file, status)
+function filemanagerutil.saveSummary(doc_settings_or_file, summary)
     -- In case the book doesn't have a sidecar file, this'll create it
-    local doc_settings
-    if type(doc_settings_or_file) == "table" then
-        doc_settings = doc_settings_or_file
-    else
-        doc_settings = DocSettings:open(doc_settings_or_file)
+    if type(doc_settings_or_file) ~= "table" then
+        doc_settings_or_file = DocSettings:open(doc_settings_or_file)
     end
-    local summary = doc_settings:readSetting("summary", {})
-    summary.status = status
     summary.modified = os.date("%Y-%m-%d", os.time())
-    doc_settings:flush()
-end
-
-function filemanagerutil.statusToString(status)
-    local status_to_text = {
-        new       = _("Unread"),
-        reading   = _("Reading"),
-        abandoned = _("On hold"),
-        complete  = _("Finished"),
-    }
-
-    return status_to_text[status]
+    doc_settings_or_file:saveSetting("summary", summary)
+    doc_settings_or_file:flush()
+    return doc_settings_or_file
 end
 
 -- Generate all book status file dialog buttons in a row
@@ -138,22 +119,52 @@ function filemanagerutil.genStatusButtonsRow(doc_settings_or_file, caller_callba
     local file, summary, status
     if type(doc_settings_or_file) == "table" then
         file = doc_settings_or_file:readSetting("doc_path")
-        summary = doc_settings_or_file:readSetting("summary", {})
+        summary = doc_settings_or_file:readSetting("summary") or {}
         status = summary.status
     else
         file = doc_settings_or_file
         summary = {}
-        status = filemanagerutil.getStatus(file)
+        status = BookList.getBookStatus(file)
     end
     local function genStatusButton(to_status)
         return {
-            text = filemanagerutil.statusToString(to_status) .. (status == to_status and "  ✓" or ""),
+            text = BookList.getBookStatusString(to_status, false, true) .. (status == to_status and "  ✓" or ""),
             enabled = status ~= to_status,
             callback = function()
                 summary.status = to_status
-                filemanagerutil.setStatus(doc_settings_or_file, to_status)
-                UIManager:broadcastEvent(Event:new("DocSettingsItemsChanged", file, { summary = summary })) -- for CoverBrowser
+                filemanagerutil.saveSummary(doc_settings_or_file, summary)
+                BookList.setBookInfoCacheProperty(file, "status", to_status)
                 caller_callback()
+            end,
+        }
+    end
+    return {
+        genStatusButton("reading"),
+        genStatusButton("abandoned"),
+        genStatusButton("complete"),
+    }
+end
+
+function filemanagerutil.genMultipleStatusButtonsRow(files, caller_callback, button_disabled)
+    local function genStatusButton(to_status)
+        return {
+            text = BookList.getBookStatusString(to_status, false, true),
+            enabled = not button_disabled,
+            callback = function()
+                UIManager:show(ConfirmBox:new{
+                    text = _("Set selected documents status?"),
+                    ok_text = _("Set"),
+                    ok_callback = function()
+                        for file in pairs(files) do
+                            local doc_settings = BookList.getDocSettings(file)
+                            local summary = doc_settings:readSetting("summary") or {}
+                            summary.status = to_status
+                            filemanagerutil.saveSummary(doc_settings, summary)
+                            BookList.setBookInfoCacheProperty(file, "status", to_status)
+                        end
+                        caller_callback()
+                    end,
+                })
             end,
         }
     end
@@ -172,8 +183,8 @@ function filemanagerutil.genResetSettingsButton(doc_settings_or_file, caller_cal
         file = doc_settings_or_file:readSetting("doc_path")
         has_sidecar_file = true
     else
-        file = ffiutil.realpath(doc_settings_or_file) or doc_settings_or_file
-        has_sidecar_file = DocSettings:hasSidecarFile(file)
+        file = ffiUtil.realpath(doc_settings_or_file) or doc_settings_or_file
+        has_sidecar_file = BookList.hasBookBeenOpened(file)
     end
     local custom_cover_file = DocSettings:findCustomCoverFile(file)
     local has_custom_cover_file = custom_cover_file and true or false
@@ -183,8 +194,6 @@ function filemanagerutil.genResetSettingsButton(doc_settings_or_file, caller_cal
         text = _("Reset"),
         enabled = not button_disabled and (has_sidecar_file or has_custom_metadata_file or has_custom_cover_file),
         callback = function()
-            local CheckButton = require("ui/widget/checkbutton")
-            local ConfirmBox = require("ui/widget/confirmbox")
             local check_button_settings, check_button_cover, check_button_metadata
             local confirmbox = ConfirmBox:new{
                 text = T(_("Reset this document?") .. "\n\n%1\n\n" ..
@@ -202,7 +211,7 @@ function filemanagerutil.genResetSettingsButton(doc_settings_or_file, caller_cal
                         UIManager:broadcastEvent(Event:new("InvalidateMetadataCache", file))
                     end
                     if data_to_purge.doc_settings then
-                        UIManager:broadcastEvent(Event:new("DocSettingsItemsChanged", file)) -- for CoverBrowser
+                        BookList.setBookInfoCacheProperty(file, "been_opened", false)
                         require("readhistory"):fileSettingsPurged(file)
                     end
                     caller_callback()
@@ -234,21 +243,27 @@ function filemanagerutil.genResetSettingsButton(doc_settings_or_file, caller_cal
     }
 end
 
-function filemanagerutil.genAddRemoveFavoritesButton(file, caller_callback, button_disabled)
-    local ReadCollection = require("readcollection")
-    local has_file = ReadCollection:hasFile(file)
+function filemanagerutil.genMultipleResetSettingsButton(files, caller_callback, button_disabled)
     return {
-        text_func = function()
-            return has_file and _("Remove from favorites") or _("Add to favorites")
-        end,
+        text = _("Reset"),
         enabled = not button_disabled,
         callback = function()
-            caller_callback()
-            if has_file then
-                ReadCollection:removeItem(file)
-            else
-                ReadCollection:addItem(file)
-            end
+            UIManager:show(ConfirmBox:new{
+                text = _("Reset selected documents?") .. "\n" ..
+                       _("Information will be permanently lost."),
+                ok_text = _("Reset"),
+                ok_callback = function()
+                    for file in pairs(files) do
+                        if BookList.hasBookBeenOpened(file) then
+                            DocSettings:open(file):purge()
+                            UIManager:broadcastEvent(Event:new("InvalidateMetadataCache", file))
+                            BookList.setBookInfoCacheProperty(file, "been_opened", false)
+                            require("readhistory"):fileSettingsPurged(file)
+                        end
+                    end
+                    caller_callback()
+                end,
+            })
         end,
     }
 end
@@ -272,14 +287,14 @@ function filemanagerutil.genShowFolderButton(file, caller_callback, button_disab
     }
 end
 
-function filemanagerutil.genBookInformationButton(file, book_props, caller_callback, button_disabled)
+function filemanagerutil.genBookInformationButton(doc_settings_or_file, book_props, caller_callback, button_disabled)
     return {
         text = _("Book information"),
         enabled = not button_disabled,
         callback = function()
             caller_callback()
-            local FileManagerBookInfo = require("apps/filemanager/filemanagerbookinfo")
-            FileManagerBookInfo:show(file, book_props and FileManagerBookInfo.extendProps(book_props))
+            local ui = require("apps/reader/readerui").instance or require("apps/filemanager/filemanager").instance
+            ui.bookinfo:show(doc_settings_or_file, book_props and ui.bookinfo.extendProps(book_props))
         end,
     }
 end
@@ -291,8 +306,8 @@ function filemanagerutil.genBookCoverButton(file, book_props, caller_callback, b
         enabled = (not button_disabled and (not book_props or has_cover)) and true or false,
         callback = function()
             caller_callback()
-            local FileManagerBookInfo = require("apps/filemanager/filemanagerbookinfo")
-            FileManagerBookInfo:onShowBookCover(file)
+            local ui = require("apps/reader/readerui").instance or require("apps/filemanager/filemanager").instance
+            ui.bookinfo:onShowBookCover(file)
         end,
     }
 end
@@ -305,52 +320,58 @@ function filemanagerutil.genBookDescriptionButton(file, book_props, caller_callb
         enabled = (not (button_disabled or book_props) or description) and true or false,
         callback = function()
             caller_callback()
-            local FileManagerBookInfo = require("apps/filemanager/filemanagerbookinfo")
-            FileManagerBookInfo:onShowBookDescription(description, file)
+            local ui = require("apps/reader/readerui").instance or require("apps/filemanager/filemanager").instance
+            ui.bookinfo:onShowBookDescription(description, file)
         end,
     }
 end
 
 -- Generate "Execute script" file dialog button
 function filemanagerutil.genExecuteScriptButton(file, caller_callback)
-    local InfoMessage = require("ui/widget/infomessage")
     return {
         -- @translators This is the script's programming language (e.g., shell or python)
         text = T(_("Execute %1 script"), util.getScriptType(file)),
         callback = function()
-            caller_callback()
-            local script_is_running_msg = InfoMessage:new{
-                -- @translators %1 is the script's programming language (e.g., shell or python), %2 is the filename
-                text = T(_("Running %1 script %2…"), util.getScriptType(file), BD.filename(ffiutil.basename(file))),
-            }
-            UIManager:show(script_is_running_msg)
-            UIManager:scheduleIn(0.5, function()
-                local rv
-                if Device:isAndroid() then
-                    Device:setIgnoreInput(true)
-                    rv = os.execute("sh " .. ffiutil.realpath(file)) -- run by sh, because sdcard has no execute permissions
-                    Device:setIgnoreInput(false)
-                else
-                    rv = os.execute(ffiutil.realpath(file))
-                end
-                UIManager:close(script_is_running_msg)
-                if rv == 0 then
-                    UIManager:show(InfoMessage:new{
-                        text = _("The script exited successfully."),
-                    })
-                else
-                    --- @note: Lua 5.1 returns the raw return value from the os's system call. Counteract this madness.
-                    UIManager:show(InfoMessage:new{
-                        text = T(_("The script returned a non-zero status code: %1!"), bit.rshift(rv, 8)),
-                        icon = "notice-warning",
-                    })
-                end
-            end)
+            filemanagerutil.executeScript(file, caller_callback)
         end,
     }
 end
 
-function filemanagerutil.showChooseDialog(title_header, caller_callback, current_path, default_path, file_filter)
+function filemanagerutil.executeScript(file, caller_callback)
+    if caller_callback then
+        caller_callback()
+    end
+    local InfoMessage = require("ui/widget/infomessage")
+    local script_is_running_msg = InfoMessage:new{
+        -- @translators %1 is the script's programming language (e.g., shell or python), %2 is the filename
+        text = T(_("Running %1 script %2…"), util.getScriptType(file), BD.filename(ffiUtil.basename(file))),
+    }
+    UIManager:show(script_is_running_msg)
+    UIManager:scheduleIn(0.5, function()
+        local rv
+        if Device:isAndroid() then
+            Device:setIgnoreInput(true)
+            rv = os.execute("sh " .. ffiUtil.realpath(file)) -- run by sh, because sdcard has no execute permissions
+            Device:setIgnoreInput(false)
+        else
+            rv = os.execute(ffiUtil.realpath(file))
+        end
+        UIManager:close(script_is_running_msg)
+        if rv == 0 then
+            UIManager:show(InfoMessage:new{
+                text = _("The script exited successfully."),
+            })
+        else
+            --- @note: Lua 5.1 returns the raw return value from the os's system call. Counteract this madness.
+            UIManager:show(InfoMessage:new{
+                text = T(_("The script returned a non-zero status code: %1!"), bit.rshift(rv, 8)),
+                icon = "notice-warning",
+            })
+        end
+    end)
+end
+
+function filemanagerutil.showChooseDialog(title_header, caller_callback, current_path, default_path, file_filter, reset_button)
     local is_file = file_filter and true or false
     local path = current_path or default_path
     local dialog
@@ -362,10 +383,10 @@ function filemanagerutil.showChooseDialog(title_header, caller_callback, current
                     UIManager:close(dialog)
                     if path then
                         if is_file then
-                            path = path:match("(.*/)")
+                            path = ffiUtil.dirname(path)
                         end
                         if lfs.attributes(path, "mode") ~= "directory" then
-                            path = G_reader_settings:readSetting("home_dir") or filemanagerutil.getDefaultDir()
+                            path = filemanagerutil.getHomeFolder()
                         end
                     end
                     local PathChooser = require("ui/widget/pathchooser")
@@ -396,6 +417,18 @@ function filemanagerutil.showChooseDialog(title_header, caller_callback, current
             },
         })
     end
+    if reset_button then
+        table.insert(buttons, {
+            {
+                text = _("Reset"),
+                enabled = current_path and true or false,
+                callback = function()
+                    UIManager:close(dialog)
+                    caller_callback()
+                end,
+            },
+        })
+    end
     local title_value = path and (is_file and BD.filepath(path) or BD.dirpath(path))
                               or _("not set")
     local ButtonDialog = require("ui/widget/buttondialog")
@@ -404,6 +437,42 @@ function filemanagerutil.showChooseDialog(title_header, caller_callback, current
         buttons = buttons,
     }
     UIManager:show(dialog)
+end
+
+function filemanagerutil.openFile(ui, file, caller_pre_callback, no_dialog)
+    local openFile = function()
+        if caller_pre_callback then
+            caller_pre_callback()
+        end
+        if ui.document then -- Reader
+            if ui.document.file ~= file then
+                local DocumentRegistry = require("document/documentregistry")
+                local provider, is_provider_forced = DocumentRegistry:getProvider(file, true) -- include auxiliary
+                if provider and provider.order then -- auxiliary
+                    -- keep the currently opened document, open the file over Reader
+                    if provider.callback then -- module
+                        provider.callback(file)
+                    else -- plugin
+                        ui[provider.provider]:openFile(file)
+                    end
+                else -- document
+                    ui:switchDocument(file, nil, nil, provider, is_provider_forced)
+                end
+            end
+        else -- FM
+            ui:openFile(file)
+        end
+    end
+
+    if not no_dialog and G_reader_settings:isTrue("file_ask_to_open") then
+        UIManager:show(ConfirmBox:new{
+            text = _("Open this file?") .. "\n\n" .. BD.filename(file:match("([^/]+)$")),
+            ok_text = _("Open"),
+            ok_callback = openFile,
+        })
+    else
+        openFile()
+    end
 end
 
 return filemanagerutil

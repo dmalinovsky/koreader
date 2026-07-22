@@ -62,21 +62,25 @@ function UIManager:init()
         UsbDevicePlugIn = function(input_event)
             -- Retrieve the argument set by Input:handleKeyBoardEv
             local evdev = table.remove(Input.fake_event_args[input_event])
-            self:broadcastEvent(Event:new("EvdevInputInsert", evdev))
+            local path = "/dev/input/event" .. tostring(evdev)
+
+            self:broadcastEvent(Event:new("EvdevInputInsert", path))
         end,
         UsbDevicePlugOut = function(input_event)
             local evdev = table.remove(Input.fake_event_args[input_event])
-            self:broadcastEvent(Event:new("EvdevInputRemove", evdev))
+            local path = "/dev/input/event" .. tostring(evdev)
+
+            self:broadcastEvent(Event:new("EvdevInputRemove", path))
         end,
     }
     self.poweroff_action = function()
-        self._entered_poweroff_stage = true
-        logger.info("Powering off the device...")
-        self:broadcastEvent(Event:new("PowerOff"))
-        self:broadcastEvent(Event:new("Close"))
         local Screensaver = require("ui/screensaver")
         Screensaver:setup("poweroff", _("Powered off"))
         Screensaver:show()
+        self._entered_poweroff_stage = true
+        logger.info("Powering off the device...")
+        self:broadcastEvent(Event:new("PowerOff"))
+        self:broadcastEvent(Event:new("Close", { keep_screensaver = true }))
         self:nextTick(function()
             Device:saveSettings()
             Device:powerOff()
@@ -88,13 +92,13 @@ function UIManager:init()
         end)
     end
     self.reboot_action = function()
-        self._entered_poweroff_stage = true
-        logger.info("Rebooting the device...")
-        self:broadcastEvent(Event:new("Reboot"))
-        self:broadcastEvent(Event:new("Close"))
         local Screensaver = require("ui/screensaver")
         Screensaver:setup("reboot", _("Rebooting…"))
         Screensaver:show()
+        self._entered_poweroff_stage = true
+        logger.info("Rebooting the device...")
+        self:broadcastEvent(Event:new("Reboot"))
+        self:broadcastEvent(Event:new("Close", { keep_screensaver = true }))
         self:nextTick(function()
             Device:saveSettings()
             Device:reboot()
@@ -118,6 +122,14 @@ end
 function UIManager:setIgnoreTouchInput(state)
     local InputContainer = require("ui/widget/container/inputcontainer")
     InputContainer:setIgnoreTouchInput(state)
+end
+
+function UIManager:setSilentMode(toggle)
+    self.silent_mode = toggle or nil
+end
+
+function UIManager:isInSilentMode()
+    return self.silent_mode or false
 end
 
 --[[--
@@ -144,6 +156,10 @@ If refreshtype is omitted, no refresh will be enqueued at this time.
 function UIManager:show(widget, refreshtype, refreshregion, x, y, refreshdither)
     if not widget then
         logger.dbg("attempted to show a nil widget")
+        return
+    end
+    if self.silent_mode and widget.honor_silent_mode then
+        logger.dbg("widget show disabled:", widget.id or widget.name or tostring(widget))
         return
     end
     logger.dbg("show widget:", widget.id or widget.name or tostring(widget))
@@ -677,21 +693,6 @@ dbg:guard(UIManager, 'setDirty',
     end)
 --]]
 
---[[--
-Clear the full repaint & refresh queues.
-
-NOTE: Beware! This doesn't take any prisonners!
-You shouldn't have to resort to this unless in very specific circumstances!
-plugins/coverbrowser.koplugin/covermenu.lua building a franken-menu out of buttondialogtitle & buttondialog
-and wanting to avoid inheriting their original paint/refresh cycle being a prime example.
---]]
-function UIManager:clearRenderStack()
-    logger.dbg("clearRenderStack: Clearing the full render stack!")
-    self._dirty = {}
-    self._refresh_func_stack = {}
-    self._refresh_stack = {}
-end
-
 function UIManager:insertZMQ(zeromq)
     table.insert(self._zeromqs, zeromq)
     return zeromq
@@ -763,7 +764,7 @@ end
 
 --- Top-to-bottom widgets iterator
 --- NOTE: VirtualKeyboard can be instantiated multiple times, and is a modal,
---        so don't be suprised if you find a couple of instances of it at the top ;).
+--        so don't be surprised if you find a couple of instances of it at the top ;).
 function UIManager:topdown_widgets_iter()
     local n = #self._window_stack
     local i = n + 1
@@ -853,7 +854,9 @@ function UIManager:unsetRunForeverMode()
     self._gated_quit = function() return self:quit(nil, true) end
 end
 
--- Ignore an empty window stack *once*; for startup w/ a missing last_file shenanigans...
+-- We'll want to return from this without actually quitting, so this is
+-- a slightly mangled UIManager:run() call to coerce the main loop into
+-- submission to ignore an empty window stack *once*.
 function UIManager:runOnce()
     -- We don't actually want to call self.quit, and we need to deal with a bit of trickery in there anyway...
     self._gated_quit = function()
@@ -962,17 +965,21 @@ function UIManager:broadcastEvent(event)
     -- Unlike sendEvent, we send the event to *all* (window-level) widgets (i.e., we don't stop, even if a handler returns true).
     -- NOTE: Same defensive approach to _window_stack changing from under our feet as above.
     local checked_widgets = {}
+    local handled = false
     local i = #self._window_stack
     while i > 0 do
         local widget = self._window_stack[i].widget
         if not checked_widgets[widget] then
             checked_widgets[widget] = true
-            widget:handleEvent(event)
+            if widget:handleEvent(event) then
+                handled = true
+            end
             i = #self._window_stack
         else
             i = i - 1
         end
     end
+    return handled
 end
 
 --[[
@@ -1114,23 +1121,21 @@ UIManager that a certain part of the screen is to be refreshed.
 ]]
 function UIManager:_refresh(mode, region, dither)
     if not mode then
-        -- If we're trying to float a dither hint up from a lower widget after a close, mode might be nil...
-        -- So use the lowest priority refresh mode (short of fast, because that'd do half-toning).
-        if dither then
-            mode = "ui"
-        else
-            -- Otherwise, this is most likely from a `show` or `close` that wasn't passed specific refresh details,
-            -- (which is the vast majority of them), in which case we drop it to avoid enqueuing a useless full-screen refresh.
-            return
-        end
+        -- This is most likely from a `show` or `close` that wasn't passed specific refresh details,
+        -- (which is the vast majority of them), in which case we drop it to avoid enqueuing a useless full-screen refresh.
+        return
     end
+
     -- Downgrade all refreshes to "fast" when ReaderPaging or ReaderScrolling have set this flag
     if self.currently_scrolling then
         mode = "fast"
     end
+
+    -- Reset the refresh counter on any explicit full refresh
     if not region and mode == "full" then
-        self.refresh_count = 0 -- reset counter on explicit full refresh
+        self.refresh_count = 0
     end
+
     -- Handle downgrading flashing modes to non-flashing modes, according to user settings.
     -- NOTE: Do it before "full" promotion and collision checks/update_mode.
     if G_reader_settings:isTrue("avoid_flashing_ui") then
@@ -1147,7 +1152,7 @@ function UIManager:_refresh(mode, region, dither)
     end
     -- special case: "partial" refreshes
     -- will get promoted every self.FULL_REFRESH_COUNT refreshes
-    -- since _refresh can be called mutiple times via setDirty called in
+    -- since _refresh can be called multiple times via setDirty called in
     -- different widgets before a real screen repaint, we should make sure
     -- refresh_count is incremented by only once at most for each repaint
     -- NOTE: Ideally, we'd only check for "partial"" w/ no region set (that neatly narrows it down to just the reader).
@@ -1181,9 +1186,9 @@ function UIManager:_refresh(mode, region, dither)
     --       as well as a few actually effective merges
     --       (e.g., the disappearance of a selection HL with the following menu update).
     for i, refresh in ipairs(self._refresh_stack) do
-        -- Check for collision with refreshes that are already enqueued
-        -- NOTE: intersect *means* intersect: we won't merge edge-to-edge regions (but the EPDC probably will).
-        if region:intersectWith(refresh.region) then
+        -- Check for collisions with refreshes that are already enqueued.
+        -- NOTE: We use the open range variant, as we want to combine rectangles that share an edge (like the EPDC).
+        if region:openIntersectWith(refresh.region) then
             -- combine both refreshes' regions
             local combined = region:combine(refresh.region)
             -- update the mode, if needed
@@ -1281,8 +1286,8 @@ function UIManager:_repaint()
     end
     self._refresh_func_stack = {}
 
-    -- we should have at least one refresh if we did repaint.  If we don't, we
-    -- add one now and log a warning if we are debugging
+    -- We should have at least one refresh if we did repaint.
+    -- If we don't, add one now and log a warning if we are debugging.
     if dirty and not self._refresh_stack[1] then
         logger.dbg("no refresh got enqueued. Will do a partial full screen refresh, which might be inefficient")
         self:_refresh("partial")
@@ -1669,7 +1674,7 @@ function UIManager:_standbyTransition()
 end
 
 -- Used by a PM transition event handler to request an early return from input polling.
--- NOTE: We can't re-use setInputTimeout to avoid interactions with ZMQ...
+-- NOTE: We can't reuse setInputTimeout to avoid interactions with ZMQ...
 function UIManager:consumeInputEarlyAfterPM(toggle)
     self._pm_consume_input_early = toggle
 end

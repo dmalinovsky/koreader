@@ -13,7 +13,7 @@ local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local InfoMessage = require("ui/widget/infomessage")
-local InputContainer = require("ui/widget/container/inputcontainer")
+local FocusManager = require("ui/widget/focusmanager")
 local MovableContainer = require("ui/widget/container/movablecontainer")
 local Notification = require("ui/widget/notification")
 local Size = require("ui/size")
@@ -31,7 +31,7 @@ local Screen = Device.screen
 local T = require("ffi/util").template
 
 -- Simple widget for showing tweak info
-local TweakInfoWidget = InputContainer:extend{
+local TweakInfoWidget = FocusManager:extend{
     tweak = nil,
     is_global_default = nil,
     toggle_global_default_callback = function() end,
@@ -95,6 +95,9 @@ function TweakInfoWidget:init()
     self.css_frame = FrameContainer:new{
         bordersize = Size.border.thin,
         padding = Size.padding.large,
+        focusable = true,
+        focus_border_size = Size.border.thick,
+        focus_inner_border = true,
         TextBoxWidget:new{
             text = self.css_text,
             face = Font:getFace("infont", 16),
@@ -158,11 +161,26 @@ function TweakInfoWidget:init()
         show_parent = self,
     }
 
+    -- Note: for devices with DPad but no clipboard, button_table is a FocusManager
+    --       so the widget should work correctly nonetheless.
+    if Device:hasDPad() and Device:hasClipboard() then
+        self.css_frame.onPress = function()
+            local item = self:getFocusItem()
+            if item == self.css_frame then
+                self:copyTextToClipboard(self.css_text)
+                return true
+            end
+        end
+        self.layout = {}
+        table.insert(self.layout, 1, { self.css_frame })
+        self:mergeLayoutInVertical(button_table)
+        self:refocusWidget()
+    end
+
     self.movable = MovableContainer:new{
         FrameContainer:new{
             background = Blitbuffer.COLOR_WHITE,
             radius = Size.radius.window,
-            margin = Size.margin.default,
             padding = Size.padding.default,
             padding_bottom = 0, -- no padding below buttontable
             VerticalGroup:new{
@@ -207,11 +225,7 @@ function TweakInfoWidget:onTap(arg, ges)
     if ges.pos:intersectWith(self.css_frame.dimen) and Device:hasClipboard() then
         -- Tap inside CSS text copies it into clipboard (so it
         -- can be pasted into the book-specific tweak editor)
-        -- (Add \n on both sides for easier pasting)
-        Device.input.setClipboardText("\n"..self.css_text.."\n")
-        UIManager:show(Notification:new{
-            text = _("CSS text copied to clipboard"),
-        })
+        self:copyTextToClipboard(self.css_text)
         return true
     elseif ges.pos:notIntersectWith(self.movable.dimen) then
         -- Tap outside closes widget
@@ -219,6 +233,15 @@ function TweakInfoWidget:onTap(arg, ges)
         return true
     end
     return false
+end
+
+function TweakInfoWidget:copyTextToClipboard(text)
+    -- (Add \n on both sides for easier pasting)
+    Device.input.setClipboardText("\n"..text.."\n")
+    UIManager:show(Notification:new{
+        text = _("CSS text copied to clipboard"),
+    })
+    return true
 end
 
 function TweakInfoWidget:onSelect()
@@ -229,7 +252,7 @@ function TweakInfoWidget:onSelect()
     return true
 end
 
--- Ordering function for tweaks when appened to css_test.
+-- Ordering function for tweaks when appended to css_test.
 -- The order needs to be consistent for crengine's stylesheet change
 -- detection code to not invalidate cache across loadings.
 local function tweakOrdering(l, r)
@@ -249,7 +272,8 @@ local ReaderStyleTweak = WidgetContainer:extend{
     nb_enabled_tweaks = 0, -- for use by main menu item
     css_text = nil, -- aggregated css text from tweaks individual css snippets
     enabled = true, -- allows for toggling between selected tweaks / none
-    dispatcher_prefix = "style_tweak_",
+    dispatcher_prefix_set = "style_tweak_set_",
+    dispatcher_prefix_toggle = "style_tweak_",
 }
 
 function ReaderStyleTweak:isTweakEnabled(tweak_id)
@@ -400,7 +424,7 @@ function ReaderStyleTweak:updateCssText(apply)
                 end
                 -- We could store what's been read into tweak.css to avoid
                 -- re-reading it, but this will allow a user to experiment
-                -- wihout having to restart KOReader
+                -- without having to restart KOReader
             end
             css = util.trim(css)
             table.insert(css_snippets, css)
@@ -447,12 +471,11 @@ function ReaderStyleTweak:onSaveSettings()
 end
 
 local function dispatcherRegisterStyleTweak(tweak_id, tweak_title)
-    Dispatcher:registerAction(ReaderStyleTweak.dispatcher_prefix..tweak_id,
-        {category="none", event="ToggleStyleTweak", arg=tweak_id, title=T(_("Toggle style tweak: %1"), tweak_title), rolling=true})
-end
-
-local function dispatcherUnregisterStyleTweak(tweak_id)
-    Dispatcher:removeAction(ReaderStyleTweak.dispatcher_prefix..tweak_id)
+    Dispatcher:registerAction(ReaderStyleTweak.dispatcher_prefix_set..tweak_id,
+        {category="string", event="ToggleStyleTweak", arg=tweak_id, title=T(_("Style tweak '%1'"), tweak_title), rolling=true,
+            args={true, false}, toggle={_("on"), _("off")}})
+    Dispatcher:registerAction(ReaderStyleTweak.dispatcher_prefix_toggle..tweak_id,
+        {category="none", event="ToggleStyleTweak", arg=tweak_id, title=T(_("Style tweak '%1' toggle"), tweak_title), rolling=true})
 end
 
 function ReaderStyleTweak:init()
@@ -566,10 +589,12 @@ You can enable individual tweaks on this book with a tap, or view more details a
                         toggle_tweak_in_dispatcher_callback = function()
                             if self.tweaks_in_dispatcher[item.id] then
                                 self.tweaks_in_dispatcher[item.id] = nil
-                                dispatcherUnregisterStyleTweak(item.id)
-                                if self.ui.profiles then
-                                    self.ui.profiles:updateProfiles(self.dispatcher_prefix..item.id)
-                                end
+                                Dispatcher:removeAction(self.dispatcher_prefix_toggle..item.id)
+                                UIManager:broadcastEvent(Event:new("DispatcherActionNameChanged",
+                                    { old_name = self.dispatcher_prefix_toggle..item.id, new_name = nil }))
+                                Dispatcher:removeAction(self.dispatcher_prefix_set..item.id)
+                                UIManager:broadcastEvent(Event:new("DispatcherActionNameChanged",
+                                    { old_name = self.dispatcher_prefix_set..item.id, new_name = nil }))
                             else
                                 self.tweaks_in_dispatcher[item.id] = item.title
                                 dispatcherRegisterStyleTweak(item.id, item.title)
@@ -632,7 +657,7 @@ You can enable individual tweaks on this book with a tap, or view more details a
                     local mode = lfs.attributes(dir.."/"..f, "mode")
                     if mode == "directory" then
                         table.insert(dir_list, f)
-                    elseif mode == "file" and string.match(f, "%.css$") then
+                    elseif mode == "file" and string.match(f, "%.css$") and not util.stringStartsWith(f, "._") then
                         table.insert(file_list, f)
                     end
                 end
@@ -681,17 +706,10 @@ You can enable individual tweaks on this book with a tap, or view more details a
         enabled_func = function() return self.enabled end,
         checked_func = function() return self.book_style_tweak_enabled end,
         callback = function(touchmenu_instance)
-            if self.book_style_tweak then
-                -- There is a tweak: toggle it on tap, like other tweaks
-                self.book_style_tweak_enabled = not self.book_style_tweak_enabled
-                self:updateCssText(true) -- apply it immediately
-            else
-                -- No tweak defined: launch editor
-                self:editBookTweak(touchmenu_instance)
-            end
+            self:onToggleBookTweak(touchmenu_instance, true)
         end,
         hold_callback = function(touchmenu_instance)
-            self:editBookTweak(touchmenu_instance)
+            self:onEditBookTweak(touchmenu_instance)
         end,
     }
     table.insert(self.tweaks_table, book_tweak_item)
@@ -715,11 +733,17 @@ function ReaderStyleTweak:addToMainMenu(menu_items)
 end
 
 function ReaderStyleTweak:onToggleStyleTweak(tweak_id, item, no_notification)
-    local text
+    local toggle
+    if type(tweak_id) == "table" then -- Dispatcher action 'Style tweak set on/off'
+        tweak_id, toggle = unpack(tweak_id)
+    end
+    if self.tweaks_by_id[tweak_id] == nil then return true end
     local enabled, g_enabled = self:isTweakEnabled(tweak_id)
+    if enabled == toggle then return true end
+    local text
     if enabled then
         if g_enabled then
-            -- if globaly enabled, mark it as disabled
+            -- if globally enabled, mark it as disabled
             -- for this document only
             self.doc_tweaks[tweak_id] = false
         else
@@ -750,11 +774,51 @@ function ReaderStyleTweak:onToggleStyleTweak(tweak_id, item, no_notification)
             text = text,
         })
     end
+    return true
 end
 
 function ReaderStyleTweak:onDispatcherRegisterActions()
     for tweak_id, tweak_title in pairs(self.tweaks_in_dispatcher) do
         dispatcherRegisterStyleTweak(tweak_id, tweak_title)
+    end
+end
+
+function ReaderStyleTweak:onToggleStyleTweaks(no_notification)
+    self.enabled = not self.enabled
+    self:updateCssText(true) -- apply it immediately
+    if not no_notification then
+        local text
+        if self.enabled then
+            text = _("Enabled style tweaks.")
+        else
+            text = _("Disabled style tweaks.")
+        end
+        UIManager:show(Notification:new{
+            text = text,
+        })
+    end
+end
+
+function ReaderStyleTweak:onToggleBookTweak(touchmenu_instance, no_notification)
+    if self.book_style_tweak then
+        -- There is a tweak: toggle it on tap, like other tweaks
+        self.book_style_tweak_enabled = not self.book_style_tweak_enabled
+        self:updateCssText(true) -- apply it immediately
+        if not no_notification then
+            -- Same format as for individual tweaks
+            local text = _("Book-specific tweak")
+            if self.book_style_tweak_enabled then
+                text = T(C_("Style tweak", "On: %1"), text)
+            else
+                text = T(C_("Style tweak", "Off: %1"), text)
+            end
+            UIManager:show(Notification:new{
+                text = text,
+            })
+        end
+    else
+        -- No tweak defined: launch editor
+        self:onEditBookTweak(touchmenu_instance)
     end
 end
 
@@ -785,11 +849,9 @@ local BOOK_TWEAK_INPUT_HINT = T([[
 
 local CSS_SUGGESTIONS = {
     { _("Long-press for info ⓘ"), _([[
-This popup menu provides a quick CSS cheat sheet, showing common selector syntax and classic CSS properties.
-It also shows some KOReader-specific non-standard CSS features, that can be useful with e-books.
+This menu provides a non-exhaustive CSS syntax and properties list. It also shows some KOReader-specific, non-standard CSS features that can be useful with e-books.
 
-Most of these CSS bits are used by our categorized Style tweaks in the top menu: look there and long-press on a style tweak to see its CSS code and a description of what it does.
-If these are not enough to trigger what you want, you may need to adapt them: tap on their CSS code to copy it to the clipboard. You can then paste it here and edit it.
+Most of these bits are already used by our categorized 'Style tweaks' (found in the top menu). Long-press on any style-tweak option to see its code and its expected results. Should these not be enough to achieve your desired look, you may need to adjust them slightly: tap once on the CSS code-box to copy the code to the clipboard, paste it here and edit it.
 
 Long-press on any item in this popup to get more information on what it does and what it can help solving.
 
@@ -873,6 +935,7 @@ You can then paste it here with long-press in the text box.]]), true},
 
     { _("Private CSS properties"), {
         { "-cr-hint: footnote-inpage;", _("When set on a block element containing the target id of a href, this block element will be shown as an in-page footnote.")},
+        { "-cr-hint: extend-footnote-inpage;", _("When set on a block element following a block element marked `footnote-inpage`, this block will be shown as part of the same in-page footnote as the previous element. Can be chained across multiple elements following an in-page footnote.")},
         { "-cr-hint: non-linear;", _("Can be set on some specific DocFragments (e.g. DocFragment[id$=_16]) to ignore them in the linear pages flow.")},
         { "-cr-hint: non-linear-combining;", _("Can be set on contiguous footnote blocks to ignore them in the linear pages flow.")},
         { "-cr-hint: toc-level1;", _("When set on an element, its text can be used to build the alternative table of contents. toc-level2 to toc-level6 can be used for nested chapters.")},
@@ -880,7 +943,7 @@ You can then paste it here with long-press in the text box.]]), true},
         { "-cr-hint: footnote;", _("Can be set on target of links (<div id='..'>) to have their link trigger as footnote popup, in case KOReader wrongly detect this target is not a footnote.")},
         { "-cr-hint: noteref;", _("Can be set on links (<a href='#..'>) to have them trigger as footnote popups, in case KOReader wrongly detect the links is not to a footnote.")},
         { "-cr-hint: noteref-ignore;", _([[
-Can be set on links (<a href='#..'>) to have them NOT trigger footnote popups and in-page footnote.
+Can be set on links (<a href='#..'>) to have them NOT trigger footnote popups and in-page footnotes.
 If some DocFragment presents an index of names with cross references, resulting in in-page footnotes taking half of these pages, you can avoid this with:
 DocFragment[id$=_16] a { -cr-hint: noteref-ignore }]])},
     }},
@@ -905,7 +968,7 @@ If used as-is, they will act on ALL elements!]]), true},
     }},
 }
 
-function ReaderStyleTweak:editBookTweak(touchmenu_instance)
+function ReaderStyleTweak:onEditBookTweak(touchmenu_instance)
     local InputDialog = require("ui/widget/inputdialog")
     local editor -- our InputDialog instance
     local tweak_button_id = "editBookTweakButton"
@@ -1011,7 +1074,7 @@ function ReaderStyleTweak:editBookTweak(touchmenu_instance)
                                 end
                                 if not is_submenu then -- insert as-is on tap
                                     UIManager:close(suggestions_popup_widget)
-                                    editor._input_widget:addChars(title)
+                                    editor:addTextToInput(title)
                                 else
                                     local sub_suggestions_popup_widget
                                     local sub_buttons = {}
@@ -1031,7 +1094,7 @@ function ReaderStyleTweak:editBookTweak(touchmenu_instance)
                                                 end
                                                 UIManager:close(sub_suggestions_popup_widget)
                                                 UIManager:close(suggestions_popup_widget)
-                                                editor._input_widget:addChars(sub_title)
+                                                editor:addTextToInput(sub_title)
                                             end,
                                             hold_callback = sub_description and function()
                                                 UIManager:show(InfoMessage:new{ text = sub_description })
@@ -1164,26 +1227,29 @@ function ReaderStyleTweak:editBookTweak(touchmenu_instance)
             if should_apply then
                 -- Let menu be closed and previous page be refreshed,
                 -- so one can see how the text is changed by the tweak.
-                touchmenu_instance:closeMenu()
+                if touchmenu_instance then
+                    touchmenu_instance:closeMenu()
+                end
                 UIManager:scheduleIn(0.2, function()
                     self:updateCssText(true) -- have it applied
                 end)
             else
-                touchmenu_instance:updateItems()
+                if touchmenu_instance then
+                    touchmenu_instance:updateItems()
+                end
             end
             editor.save_callback_called = true
             return true, msg
         end,
-        close_callback = function()
+        close_callback = function(close_status)
             -- save_callback() will always have shown some notification,
-            -- so don't add another one
-            if not editor.save_callback_called then
+            -- so don't add another one.
+            -- If close_status is false, text was modified but then discarded, and
+            -- InputDialog will show our close_discarded_notif_text
+            if not editor.save_callback_called and close_status ~= false then
                 UIManager:show(Notification:new{
-                    text = NOT_MODIFIED_MSG,
+                    text = NOT_MODIFIED_MSG
                 })
-                -- This has to be the same message above and below: when
-                -- discarding, we can't prevent these 2 notifications from
-                -- being shown: having them identical will hide that.
             end
         end,
         close_discarded_notif_text = NOT_MODIFIED_MSG,

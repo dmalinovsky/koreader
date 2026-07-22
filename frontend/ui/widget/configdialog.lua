@@ -29,6 +29,7 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local logger = require("logger")
 local serpent = require("ffi/serpent")
+local util = require("util")
 local _ = require("gettext")
 local Screen = Device.screen
 local T = require("ffi/util").template
@@ -346,6 +347,8 @@ function ConfigOption:init()
                     return math.abs(val1 - val2)
                 elseif type(val1) == "string" then
                     return val1 == val2 and 0 or 1
+                elseif val1 == nil then
+                    return 1
                 end
             end
             if self.options[c].name then
@@ -546,10 +549,12 @@ function ConfigOption:init()
                 local row_count = self.options[c].row_count or 1
                 local toggle_height = Screen:scaleBySize(self.options[c].height
                                                          or (30 * row_count))
+                local toggle = {} -- keep options intact
+                for i = 1, #self.options[c].toggle do
+                    toggle[i] = self.options[c].toggle[i]
+                end
                 if self.options[c].more_options then
-                    table.insert(self.options[c].toggle, "⋮")
-                    table.insert(self.options[c].args, "⋮")
-                    self.options[c].more_options = false
+                    table.insert(toggle, "⋮")
                 end
                 local switch = ToggleSwitch:new{
                     width = math.min(max_toggle_width, toggle_width),
@@ -558,7 +563,7 @@ function ConfigOption:init()
                     font_size = item_font_size,
                     name = self.options[c].name,
                     name_text = name_text,
-                    toggle = self.options[c].toggle,
+                    toggle = toggle,
                     alternate = self.options[c].alternate,
                     values = self.options[c].values,
                     args = self.options[c].args,
@@ -568,7 +573,7 @@ function ConfigOption:init()
                     enabled = enabled,
                     row_count = row_count,
                     callback = function(arg)
-                        if self.options[c].toggle[arg] == "⋮" then
+                        if toggle[arg] == "⋮" then
                             if self.options[c].show_true_value_func and not self.options[c].more_options_param.show_true_value_func then
                                 self.options[c].more_options_param.show_true_value_func = self.options[c].show_true_value_func
                             end
@@ -684,7 +689,7 @@ function ConfigOption:_itemGroupToLayoutLine(option_items_group)
             if v.layout and v.disableFocusManagement then -- it is a FocusManager
                 -- merge child layout to one row layout
                 -- currently child widgets are all one row
-                -- need improved if two or more rows widget existed
+                -- needs improvement if we ever implement widgets with two or more rows
                 for _, row in ipairs(v.layout) do
                     for _, widget in ipairs(row) do
                         layout_line[j] = widget
@@ -892,15 +897,22 @@ function ConfigDialog:init()
     }
     if Device:hasKeys() then
         -- set up keyboard events
-        local close_keys = Device:hasFewKeys() and { "Back", "Left" } or Device.input.group.Back
-        self.key_events.Close = { { close_keys } }
+        local back_group = util.tableDeepCopy(Device.input.group.Back)
+        if Device:hasFewKeys() then
+            table.insert(back_group, "Left")
+            self.key_events.Close = { { back_group } }
+        else
+            table.insert(back_group, "Menu")
+            table.insert(back_group, "AA")
+            self.key_events.Close = { { back_group } }
+        end
     end
 end
 
 function ConfigDialog:updateConfigPanel(index) end
 
 function ConfigDialog:update()
-    self:moveFocusTo(1, 1) -- reset selected for re-created layout
+    self:moveFocusTo(1, 1, FocusManager.NOT_FOCUS) -- reset selected for re-created layout
     self.layout = {}
 
     if self.config_menubar then
@@ -1124,6 +1136,11 @@ function ConfigDialog:onConfigMoreChoose(values, default_value_orig, name, event
                 UIManager:setDirty(self, function()
                     return "ui", self.dialog_frame.dimen
                 end)
+                -- FocusManager loses its marbles (we can only navigate on the row of the selected option) if we don't update the widget *again*...
+                -- (possibly because of the layout nastiness happening in ConfigOption:init)
+                if Device:hasDPad() then
+                    self:update()
+                end
             end
         end
         local hide_on_picker_show = more_options_param.hide_on_picker_show

@@ -14,7 +14,7 @@ local KindlePowerD = BasePowerD:new{
 
 function KindlePowerD:init()
     local haslipc, lipc = pcall(require, "liblipclua")
-    if haslipc and lipc then
+    if haslipc then
         self.lipc_handle = lipc.init("com.github.koreader.kindlepowerd")
     end
 
@@ -22,6 +22,33 @@ function KindlePowerD:init()
     -- which allows us to keep being able to use said step 0 as the first "on" step.
     if not self.device:canTurnFrontlightOff() then
         self.fl_max = self.fl_max + 1
+    end
+
+    if self.device:hasAuxBattery() then
+        self.getAuxCapacityHW = function(this)
+            return this:unchecked_read_int_file(self.aux_batt_capacity_file)
+        end
+
+        self.isAuxBatteryConnectedHW = function(this)
+            local status = this:read_str_file(self.aux_batt_status_file)
+            if status == nil then
+                -- File could not be read, assume not connected
+                return false
+            end
+            -- File was read, assume aux battery is connected
+            return true
+        end
+
+        self.isAuxChargingHW = function(this)
+            -- "Discharging" when discharging
+            -- "Full" when full
+            -- "Charging" when charging via DCP
+            return this:read_str_file(this.aux_batt_status_file) ~= "Discharging"
+        end
+
+        self.isAuxChargedHW = function(this)
+            return this:read_str_file(this.aux_batt_status_file) == "Full"
+        end
     end
 
     self:initWakeupMgr()
@@ -113,12 +140,16 @@ function KindlePowerD:setIntensityHW(intensity)
         -- NOTE: when intensity is 0, we want to *really* kill the light, so do it manually
         -- (asking lipc to set it to 0 would in fact set it to > 0 on ! canTurnFrontlightOff Kindles).
         -- We do *both* to make the fl restore on resume less jarring on devices where lipc 0 != off.
-        ffiUtil.writeToSysfs(intensity, self.fl_intensity_file)
+        for _, fl_intensity_file in ipairs(self.fl_intensity_files) do
+            ffiUtil.writeToSysfs(intensity, fl_intensity_file)
+        end
 
         -- And in case there are two LED groups...
         -- This should never happen as all warmth devices so far canTurnFrontlightOff
-        if self.warmth_intensity_file then
-            ffiUtil.writeToSysfs(intensity, self.warmth_intensity_file)
+        if self.warmth_intensity_files then
+            for _, warmth_intensity_file in ipairs(self.warmth_intensity_files ) do
+                ffiUtil.writeToSysfs(intensity, warmth_intensity_file)
+            end
         end
     end
 
@@ -189,13 +220,21 @@ function KindlePowerD:isHallSensorEnabled()
     return int == 1
 end
 
-function KindlePowerD:onToggleHallSensor()
-    local stat = self:isHallSensorEnabled()
-    ffiUtil.writeToSysfs(stat and 0 or 1, self.hall_file)
+function KindlePowerD:onToggleHallSensor(toggle)
+    if toggle == nil then
+        -- Flip it
+        toggle = self:isHallSensorEnabled() and 0 or 1
+    else
+        -- Honor the requested state
+        toggle = toggle and 1 or 0
+    end
+    ffiUtil.writeToSysfs(toggle, self.hall_file)
+
+    G_reader_settings:saveSetting("kindle_hall_effect_sensor_enabled", toggle == 1 and true or false)
 end
 
 function KindlePowerD:_readFLIntensity()
-    return self:read_int_file(self.fl_intensity_file)
+    return self:read_int_file(self.fl_intensity_files[1])
 end
 
 function KindlePowerD:toggleSuspend()
@@ -230,11 +269,11 @@ function KindlePowerD:checkUnexpectedWakeup()
     if self.device.wakeup_mgr:isWakeupAlarmScheduled() and self.device.wakeup_mgr:wakeupAction(90) then
         logger.info("Kindle scheduled wakeup")
     else
-        logger.warn("Kindle unscheduled wakeup")
+        logger.info("Kindle unscheduled wakeup")
     end
 end
 
--- Dummy fuctions. They will be defined in initWakeupMgr
+-- Dummy functions. They will be defined in initWakeupMgr
 function KindlePowerD:wakeupFromSuspend() end
 function KindlePowerD:readyToSuspend() end
 

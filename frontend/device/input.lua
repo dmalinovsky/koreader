@@ -9,7 +9,6 @@ local GestureDetector = require("device/gesturedetector")
 local Key = require("device/key")
 local UIManager
 local framebuffer = require("ffi/framebuffer")
-local input = require("ffi/input")
 local logger = require("logger")
 local time = require("ui/time")
 local _ = require("gettext")
@@ -28,6 +27,8 @@ local KEY_RELEASE = 0
 -- Based on ABS_MT_TOOL_TYPE values on Elan panels
 local TOOL_TYPE_FINGER = 0
 local TOOL_TYPE_PEN    = 1
+local TOOL_TYPE_ERASER = 2
+local TOOL_TYPE_HIGHLIGHTER = 3
 
 -- For debug logging of ev.type
 local linux_evdev_type_map = {
@@ -62,6 +63,7 @@ local linux_evdev_key_code_map = {
     [C.BTN_TOUCH] = "BTN_TOUCH",
     [C.BTN_STYLUS] = "BTN_STYLUS",
     [C.BTN_STYLUS2] = "BTN_STYLUS2",
+    [C.BTN_TOOL_DOUBLETAP] = "BTN_TOOL_DOUBLETAP",
 }
 
 local linux_evdev_abs_code_map = {
@@ -139,7 +141,7 @@ local Input = {
             "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
             "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
             "Up", "Down", "Left", "Right", "Press", "Backspace", "End",
-            "Back", "Sym", "AA", "Menu", "Home", "Del",
+            "Back", "Sym", "AA", "Menu", "Home", "Del", "ScreenKB",
             "LPgBack", "RPgBack", "LPgFwd", "RPgFwd"
         },
     },
@@ -171,6 +173,7 @@ local Input = {
         Shift = false,
         Sym = false,
         Meta = false,
+        ScreenKB = false,
     },
 
     -- repeat state:
@@ -185,7 +188,7 @@ local Input = {
     ev_slots = nil, -- table
     gesture_detector = nil,
 
-    -- simple internal clipboard implementation, can be overidden to use system clipboard
+    -- simple internal clipboard implementation, can be overridden to use system clipboard
     hasClipboardText = function()
         return _internal_clipboard_text ~= ""
     end,
@@ -195,6 +198,10 @@ local Input = {
     setClipboardText = function(text)
         _internal_clipboard_text = text or ""
     end,
+
+    -- open'ed input devices hashmap (key: path, value: fd number)
+    -- Must be a class member, both because Input is a singleton and that state is process-wide anyway.
+    opened_devices = {},
 }
 
 function Input:new(o)
@@ -206,6 +213,35 @@ function Input:new(o)
 end
 
 function Input:init()
+    -- Setup underlying input implementation.
+    if self.input then -- luacheck: ignore 542
+        -- Already setup (e.g. stubbed by the testsuite).
+    elseif self.device:isSDL() then
+        self.input = require("ffi/input_SDL3")
+        self.hasClipboardText = function()
+            return self.input.hasClipboardText()
+        end
+        self.getClipboardText = function()
+            return self.input.getClipboardText()
+        end
+        self.setClipboardText = function(text)
+            return self.input.setClipboardText(text)
+        end
+        self.gameControllerRumble = function(left_intensity, right_intensity, duration)
+            return self.input.gameControllerRumble(left_intensity, right_intensity, duration)
+        end
+    elseif self.device:isAndroid() then
+        self.input = require("ffi/input_android")
+    elseif self.device:isPocketBook() then
+        self.input = require("ffi/input_pocketbook")
+    elseif self.device:isRemarkable() and os.getenv("KO_USE_QTFB") == "1" then
+        self.input = require("ffi/input_qtfb")
+    elseif self.device:isRemarkable() and os.getenv("KO_USE_BLIGHT") == "1" then
+        self.input = require("ffi/input_blight")
+    else
+        self.input = require("libs/libkoreader-input")
+    end
+
     -- Initialize instance-specific tables
     -- NOTE: All of these arrays may be destroyed & recreated at runtime, so we don't want a parent/class object for those.
     self.timer_callbacks = {}
@@ -295,14 +331,89 @@ function Input:disableRotationMap()
 end
 
 --[[--
-Wrapper for FFI input open.
+Wrapper for our Lua/C input module's open.
 
 Note that we adhere to the "." syntax here for compatibility.
 
-@todo Clean up separation FFI/this.
+The `name` argument is optional, and used for logging purposes only.
 --]]
-function Input.open(device, is_emu_events)
-    return input.open(device, is_emu_events and 1 or 0)
+function Input:open(path, name)
+    if self.input.is_ffi then
+        return self.input.open(path, name)
+    end
+    -- Make sure we don't open the same device twice.
+    if not Input.opened_devices[path] then
+        local fd = self.input.open(path)
+        if fd then
+            Input.opened_devices[path] = fd
+            if name then
+                logger.dbg("Opened fd", fd, "for input device", name, "@", path)
+            else
+                logger.dbg("Opened fd", fd, "for input device @", path)
+            end
+        end
+        -- No need to log failures, input will have raised an error already,
+        -- and we want to make those fatal, so we don't protect this call.
+        return fd
+    end
+end
+
+--[[--
+Wrapper for our Lua/C input module's fdopen.
+
+Note that we adhere to the "." syntax here for compatibility.
+
+The `name` argument is optional, and used for logging purposes only.
+`path` is mandatory, though!
+--]]
+function Input:fdopen(fd, path, name)
+    -- Make sure we don't open the same device twice.
+    if not Input.opened_devices[path] then
+        self.input.fdopen(fd)
+        -- As with input.open, it will throw on error (closing the fd first)
+        Input.opened_devices[path] = fd
+        if name then
+            logger.dbg("Kept fd", fd, "open for input device", name, "@", path)
+        else
+            logger.dbg("Kept fd", fd, "open for input device @", path)
+        end
+        return fd
+    end
+end
+
+--[[--
+Wrapper for our Lua/C input module's close.
+
+Note that we adhere to the "." syntax here for compatibility.
+--]]
+function Input:close(path)
+    if self.input.is_ffi then
+        return self.input.close(path)
+    end
+    -- Make sure we actually know about this device
+    local fd = Input.opened_devices[path]
+    if fd then
+        local ok, err = self.input.close(fd)
+        if ok or err == C.ENODEV then
+            -- Either the call succeeded,
+            -- or the backend had already caught an ENODEV in waitForInput and closed the fd internally.
+            -- (Because the EvdevInputRemove Event comes from an UsbDevicePlugOut uevent forwarded as an... *input* EV_KEY event ;)).
+            -- Regardless, that device is gone, so clear its spot in the hashmap.
+            Input.opened_devices[path] = nil
+        end
+    else
+        logger.warn("Tried to close an unknown input device @", path)
+    end
+end
+
+--[[--
+Wrapper for our Lua/C input module's closeAll.
+
+Note that we adhere to the "." syntax here for compatibility.
+--]]
+function Input:teardown()
+    self.input.closeAll()
+    Input.opened_devices = {}
 end
 
 --[[--
@@ -344,6 +455,66 @@ end
 
 function Input:gestureAdjustHook(ges)
     -- do nothing by default
+end
+
+--[[--
+Register a callback for stylus/pen events.
+Called before gesture detection with fully processed slot data.
+The callback receives the Input object and a slot table: {slot, id, x, y, tool, timev}.
+Return true from the callback to dominate the event and remove it from gesture detection.
+]]
+function Input:registerStylusCallback(callback)
+    self.stylus_callback = callback
+    logger.info("Input: stylus callback registered, pen_slot =", self.pen_slot)
+end
+
+function Input:unregisterStylusCallback()
+    self.stylus_callback = nil
+    logger.info("Input: stylus callback unregistered")
+end
+
+--[[--
+Filter stylus events from MTSlots and route them to the stylus callback.
+Called before gesture detection. Modifies self.MTSlots in place.
+--]]
+function Input:routeStylusEvents()
+    if not self.stylus_callback or not self.MTSlots or #self.MTSlots == 0 then
+        return
+    end
+
+    local dominated_indices = {}
+
+    for i, slot in ipairs(self.MTSlots) do
+        local is_stylus = slot.tool == TOOL_TYPE_PEN
+            or slot.tool == TOOL_TYPE_ERASER
+            or slot.tool == TOOL_TYPE_HIGHLIGHTER
+            or (self.pen_slot and slot.slot == self.pen_slot)
+
+        if is_stylus then
+            if slot.tool == TOOL_TYPE_PEN then
+                if self.stylus_eraser_active then
+                    slot.tool = TOOL_TYPE_ERASER
+                elseif self.stylus_highlighter_active then
+                    slot.tool = TOOL_TYPE_HIGHLIGHTER
+                end
+            end
+
+            logger.dbg("Input:routeStylusEvents: stylus detected in slot", slot.slot,
+                       "tool=", slot.tool, "id=", slot.id, "x=", slot.x, "y=", slot.y,
+                       "pen_slot=", self.pen_slot, "eraser=", self.stylus_eraser_active,
+                       "highlighter=", self.stylus_highlighter_active)
+            local dominated = self.stylus_callback(self, slot)
+            if dominated then
+                table.insert(dominated_indices, i)
+                logger.dbg("Input:routeStylusEvents: slot", slot.slot,
+                           "dominated, will remove from gesture detection")
+            end
+        end
+    end
+
+    for i = #dominated_indices, 1, -1 do
+        table.remove(self.MTSlots, dominated_indices[i])
+    end
 end
 
 --- Catalog of predefined hooks.
@@ -448,7 +619,7 @@ function Input:setTimeout(slot, ges, cb, origin, delay)
 
     -- If we're on a platform with the timerfd backend, handle that
     local timerfd
-    if input.setTimer then
+    if self.input.setTimer then
         -- If GestureDetector's clock source probing was inconclusive, do this on the UI timescale instead.
         if clock_id == -1 then
             deadline = time.now() + delay
@@ -460,7 +631,7 @@ function Input:setTimeout(slot, ges, cb, origin, delay)
         -- instead of ensuring that ourselves via a polling timeout.
         -- This ensures perfect accuracy, and allows it to be computed in the event's own timescale.
         local sec, usec = time.split_s_us(deadline)
-        timerfd = input.setTimer(clock_id, sec, usec)
+        timerfd = self.input.setTimer(clock_id, sec, usec)
     end
     if timerfd then
             -- It worked, tweak the table a bit to make it clear the deadline will be handled by the kernel
@@ -494,7 +665,7 @@ function Input:clearTimeout(slot, ges)
         if item.slot == slot and (not ges or item.gesture == ges) then
             -- If the timerfd backend is in use, close the fd and free the list's node, too.
             if item.timerfd then
-                input.clearTimer(item.timerfd)
+                self.input.clearTimer(item.timerfd)
             end
             table.remove(self.timer_callbacks, i)
         end
@@ -503,10 +674,10 @@ end
 
 function Input:clearTimeouts()
     -- If the timerfd backend is in use, close the fds, too
-    if input.setTimer then
+    if self.input.setTimer then
         for _, item in ipairs(self.timer_callbacks) do
             if item.timerfd then
-                input.clearTimer(item.timerfd)
+                self.input.clearTimer(item.timerfd)
             end
         end
     end
@@ -566,22 +737,40 @@ function Input:handleKeyBoardEv(ev)
 
             return
         end
-    elseif self.wacom_protocol then
-        if ev.code == C.BTN_TOOL_PEN then
-            -- Switch to the dedicated pen slot, and make sure it's active, as this can come in a dedicated input frame
-            self:setupSlotData(self.pen_slot)
-            if ev.value == 1 then
-                self:setCurrentMtSlot("tool", TOOL_TYPE_PEN)
-            else
-                self:setCurrentMtSlot("tool", TOOL_TYPE_FINGER)
-                -- Switch back to our main finger slot
-                self.cur_slot = self.main_finger_slot
-            end
+    end
 
-            return
-        elseif ev.code == C.BTN_TOUCH then
-            -- BTN_TOUCH is bracketed by BTN_TOOL_PEN, so we can limit this to pens, to avoid stomping on panel slots.
-            if self:getCurrentMtSlotData("tool") == TOOL_TYPE_PEN then
+    local is_sdl = self.device:isSDL()
+
+    -- On Kobo-style stylus devices, barrel/tool buttons can double as
+    -- eraser/highlighter tool selectors. SDL/Linux pen buttons are handled as
+    -- plain buttons instead, so standard side buttons don't rewrite the tool.
+    local stylus_buttons_select_tool = not is_sdl
+    if stylus_buttons_select_tool then
+        if ev.code == C.BTN_STYLUS then
+            self.stylus_eraser_active = ev.value == 1
+        elseif ev.code == C.BTN_STYLUS2 then
+            self.stylus_highlighter_active = ev.value == 1
+        end
+    end
+
+    local stylus_tool_protocol = self.wacom_protocol or is_sdl
+    if stylus_tool_protocol and (ev.code == C.BTN_TOOL_PEN or ev.code == C.BTN_TOOL_RUBBER) then
+        -- Switch to the dedicated pen slot, and make sure it's active, as this can come in a dedicated input frame.
+        self:setupSlotData(self.pen_slot)
+        if ev.value == 1 then
+            self:setCurrentMtSlot("tool", ev.code == C.BTN_TOOL_RUBBER and TOOL_TYPE_ERASER or TOOL_TYPE_PEN)
+        else
+            self:setCurrentMtSlot("tool", TOOL_TYPE_FINGER)
+            -- Switch back to our main finger slot.
+            self.cur_slot = self.main_finger_slot
+        end
+
+        return
+    elseif self.wacom_protocol then
+        if ev.code == C.BTN_TOUCH then
+            -- BTN_TOUCH is bracketed by BTN_TOOL_PEN/BTN_TOOL_RUBBER, so we can limit this to styluses, to avoid stomping on panel slots.
+            local tool = self:getCurrentMtSlotData("tool")
+            if tool == TOOL_TYPE_PEN or tool == TOOL_TYPE_ERASER then
                 -- Make sure the pen slot is active, as this can come in a dedicated input frame
                 -- (i.e., we need it to be referenced by self.MTSlots for the lift to be picked up in the EV_SYN:SYN_REPORT handler).
                 -- (Conversely, getCurrentMtSlotData pokes at the *persistent* slot data in self.ev_slots,
@@ -599,6 +788,14 @@ function Input:handleKeyBoardEv(ev)
 
             return
         end
+    end
+    -- On (some?) Kindles, cyttsp will report BTN_TOOL_DOUBLETAP on a two-slot contact... but with no data in the second slot :/.
+    -- c.f., https://github.com/koreader/koreader/pull/13714
+    if ev.code == C.BTN_TOOL_DOUBLETAP and ev.value == 1 and self.cur_slot ~= self.main_finger_slot and (self:getCurrentMtSlotData("x") == nil or self:getCurrentMtSlotData("y") == nil) then
+        -- Drop the empty slot to avoid breaking GestureDetector
+        self:setCurrentMtSlot("id", -1)
+
+        return
     end
 
     local keycode = self.event_map[ev.code]
@@ -654,12 +851,48 @@ function Input:handleKeyBoardEv(ev)
         UIManager:nextTick(function() UIManager:quit() end) -- Ensure the program closes in case of some lingering dialog.
     end
 
+    -- A lone Sym or ScreenKB key tap (pressed and released with no other key in
+    -- between) is used by InputText to toggle the on-screen keyboard, mirroring
+    -- Shift/ScreenKB + Home. Both are otherwise only modifiers whose bare
+    -- press/release is swallowed just below, so we track which one, if any, was
+    -- "tapped alone" across the press/release pair. It only counts as a lone tap
+    -- if no other modifier is held at press time (the key itself is not marked in
+    -- self.modifiers until the block below), so combinations like Shift + Sym do
+    -- not toggle the keyboard. Pressing any other key clears the flag, so the
+    -- symbol layer (Sym + key) never toggles. A held Sym is not a tap either: on
+    -- the Kindle 3 mxckpd advertises EV_REP (~1s delay then ~5 Hz), so a held Sym
+    -- repeats; any event for it that is neither a press nor a release clears the
+    -- flag and a long hold does not toggle on release. That guard also covers
+    -- "Disable key repeat" (Kindle:toggleKeyRepeat), which rewrites the repeat
+    -- value to -1 rather than dropping the event. The ScreenKB key (Kindle 4) does
+    -- not emit repeats, so it needs no such guard; a bare press/release is a tap.
+    if ev.value == KEY_PRESS then
+        local solo = keycode == "Sym" or keycode == "ScreenKB"
+        if solo then
+            for _, held in pairs(self.modifiers) do
+                if held then
+                    solo = false
+                    break
+                end
+            end
+        end
+        self.keyboard_toggle_tapped = solo and keycode or nil
+    elseif ev.value ~= KEY_RELEASE and keycode == "Sym" then
+        self.keyboard_toggle_tapped = nil
+    end
+
     -- handle modifier keys
     if self.modifiers[keycode] ~= nil then
         if ev.value == KEY_PRESS then
             self.modifiers[keycode] = true
         elseif ev.value == KEY_RELEASE then
             self.modifiers[keycode] = false
+            if self.keyboard_toggle_tapped == keycode then
+                self.keyboard_toggle_tapped = nil
+                -- Surface the lone tap as a dedicated key event; nothing else binds it.
+                local tap_key = keycode == "Sym" and "SymPress" or "ScreenKBPress"
+                return Event:new("KeyPress", Key:new(tap_key, self.modifiers))
+            end
         end
         return
     end
@@ -669,28 +902,31 @@ function Input:handleKeyBoardEv(ev)
     if ev.value == KEY_PRESS then
         return Event:new("KeyPress", key)
     elseif ev.value == KEY_REPEAT then
-        -- NOTE: We only care about repeat events from the pageturn buttons...
+        -- NOTE: We only care about repeat events from the page-turn buttons and cursor keys...
         --       And we *definitely* don't want to flood the Event queue with useless SleepCover repeats!
-        if keycode == "LPgBack"
-        or keycode == "RPgBack"
-        or keycode == "LPgFwd"
-        or keycode == "RPgFwd" then
+        if keycode == "Up" or keycode == "Down" or keycode == "Left" or keycode == "Right"
+         or keycode == "RPgBack" or keycode == "RPgFwd" or keycode == "LPgBack" or keycode == "LPgFwd" then
             --- @fixme Crappy event staggering!
             --
             -- The Forma & co repeats every 80ms after a 400ms delay, and 500ms roughly corresponds to a flashing update,
             -- so stuff is usually in sync when you release the key.
-            -- Obvious downside is that this ends up slower than just mashing the key.
             --
             -- A better approach would be an onKeyRelease handler that flushes the Event queue...
-            self.repeat_count = self.repeat_count + 1
-            if self.repeat_count == 1 then
+            local rep_period = self.device.key_repeat and self.device.key_repeat[C.REP_PERIOD] or 80
+            local now = time.now()
+            if not self.last_repeat_time then
+                self.last_repeat_time = now
                 return Event:new("KeyRepeat", key)
-            elseif self.repeat_count >= 6 then
-                self.repeat_count = 0
+            else
+                local time_diff = time.to_ms(now - self.last_repeat_time)
+                if time_diff >= rep_period then
+                    self.last_repeat_time = now
+                    return Event:new("KeyRepeat", key)
+                end
             end
         end
     elseif ev.value == KEY_RELEASE then
-        self.repeat_count = 0
+        self.last_repeat_time = nil
         return Event:new("KeyRelease", key)
     end
 end
@@ -715,6 +951,23 @@ function Input:handlePowerManagementOnlyEv(ev)
         return keycode
     end
 
+    -- Treat page turn button like the latest kobo firmware when suspended
+    if G_reader_settings:isTrue("pageturn_power") then
+        if keycode == "RPgBack" or keycode == "LPgBack"
+        or keycode == "RPgFwd" or keycode == "LPgFwd" then
+            -- When suspended, pretend that the page turn button is *almost* a power button...
+            if ev.value == KEY_PRESS or ev.value == KEY_REPEAT then
+                -- Swallow key press/release events to avoid sending unbalanced events for the actual key being pressed
+                return
+            elseif ev.value == KEY_RELEASE then
+                -- We only want to deal with key release events,
+                -- to avoid tripping the Kobo-specific "poweroff on hold" PowerPress handler...
+                -- (i.e., Power is a very very specific case where unbalanced press/release events *should* be fine).
+                return "PowerRelease"
+            end
+        end
+    end
+
     if self.fake_event_set[keycode] then
         if self.fake_event_args[keycode] then
             table.insert(self.fake_event_args[keycode], ev.value)
@@ -730,6 +983,16 @@ function Input:handlePowerManagementOnlyEv(ev)
         elseif ev.value == KEY_RELEASE then
             return "PowerRelease"
         end
+    end
+
+    -- Make sure we don't leave modifiers in an inconsistent state
+    if self.modifiers[keycode] ~= nil then
+        if ev.value == KEY_PRESS then
+            self.modifiers[keycode] = true
+        elseif ev.value == KEY_RELEASE then
+            self.modifiers[keycode] = false
+        end
+        return
     end
 
     -- Nothing to see, move along!
@@ -796,30 +1059,10 @@ function Input:handleTouchEv(ev)
         --       * PocketBook, because of our InkView EVT_POINTERMOVE translation
         --         (c.f., translateEvent @ ffi/input_pocketbook.lua).
         --       * SDL, because of our SDL_MOUSEMOTION/SDL_FINGERMOTION translation
-        --         (c.f., waitForEvent @ ffi/SDL2_0.lua).
+        --         (c.f., waitForEvent @ ffi/SDL3.lua).
         if ev.code == C.ABS_MT_SLOT then
             self:setupSlotData(ev.value)
         elseif ev.code == C.ABS_MT_TRACKING_ID then
-            if self.snow_protocol then
-                -- NOTE: We'll never get an ABS_MT_SLOT event, instead we have a slot-like ABS_MT_TRACKING_ID value...
-                --       This also means that, unlike on sane devices, this will *never* be set to -1 on contact lift,
-                --       which is why we instead have to rely on EV_KEY:BTN_TOUCH:0 for that (c.f., handleKeyBoardEv).
-                if ev.value == -1 then
-                    -- NOTE: While *actual* snow_protocol devices will *never* emit an EV_ABS:ABS_MT_TRACKING_ID:-1 event,
-                    --       we've seen brand new revisions of snow_protocol devices shipping with sane panels instead,
-                    --       so we'll need to disable the quirks at runtime to handle these properly...
-                    --       (c.f., https://www.mobileread.com/forums/showpost.php?p=4383629&postcount=997).
-                    -- NOTE: Simply skipping the slot storage setup for -1 would not be enough, as it would only fix ST handling.
-                    --       MT would be broken, because buddy contact detection in GestureDetector looks at slot +/- 1,
-                    --       whereas we'd be having the main contact point at a stupidly large slot number
-                    --       (because it would match ABS_MT_TRACKING_ID, given the lack of ABS_MT_SLOT, at least for the first input frame),
-                    --       while the second contact would be at slot 1, because it would immediately have required emitting a proper ABS_MT_SLOT event...
-                    logger.warn("Input: Disabled snow_protocol quirks because your device's hardware revision doesn't appear to need them!")
-                    self.snow_protocol = false
-                else
-                    self:setupSlotData(ev.value)
-                end
-            end
             self:setCurrentMtSlotChecked("id", ev.value)
         elseif ev.code == C.ABS_MT_TOOL_TYPE then
             -- NOTE: On the Elipsa: Finger == 0; Pen == 1
@@ -839,6 +1082,7 @@ function Input:handleTouchEv(ev)
             for _, MTSlot in ipairs(self.MTSlots) do
                 self:setMtSlot(MTSlot.slot, "timev", time.timeval(ev.time))
             end
+            self:routeStylusEvents()
             -- feed ev in all slots to state machine
             local touch_gestures = self.gesture_detector:feedEvent(self.MTSlots)
             self:newFrame()
@@ -880,6 +1124,73 @@ function Input:handleMixedTouchEv(ev)
             for _, MTSlot in ipairs(self.MTSlots) do
                 self:setMtSlot(MTSlot.slot, "timev", time.timeval(ev.time))
             end
+            self:routeStylusEvents()
+            -- feed ev in all slots to state machine
+            local touch_gestures = self.gesture_detector:feedEvent(self.MTSlots)
+            self:newFrame()
+            local ges_evs = {}
+            for _, touch_ges in ipairs(touch_gestures) do
+                self:gestureAdjustHook(touch_ges)
+                table.insert(ges_evs, Event:new("Gesture", self.gesture_detector:adjustGesCoordinate(touch_ges)))
+            end
+            return ges_evs
+        end
+    end
+end
+
+-- Slightly mangled variant of handleTouchEv to deal with the various quirks of the so-called "snow" protocol over the years...
+function Input:handleTouchEvSnow(ev)
+    if ev.type == C.EV_ABS then
+        -- NOTE: Ideally, an input frame starts with either ABS_MT_SLOT or ABS_MT_TRACKING_ID,
+        --       but they *both* may be omitted if the last contact point just moved without lift.
+        --       The use of setCurrentMtSlotChecked instead of setCurrentMtSlot ensures
+        --       we actually setup the slot data storage and/or reference for the current slot in this case,
+        --       as the reference list is empty at the beginning of an input frame (c.f., Input:newFrame).
+        --       The most common platforms where you'll see this happen are:
+        --       * PocketBook, because of our InkView EVT_POINTERMOVE translation
+        --         (c.f., translateEvent @ ffi/input_pocketbook.lua).
+        --       * SDL, because of our SDL_MOUSEMOTION/SDL_FINGERMOTION translation
+        --         (c.f., waitForEvent @ ffi/SDL3.lua).
+        if ev.code == C.ABS_MT_SLOT then
+            self:setupSlotData(ev.value)
+        elseif ev.code == C.ABS_MT_TRACKING_ID then
+            -- NOTE: We'll never get an ABS_MT_SLOT event, instead we have a slot-like ABS_MT_TRACKING_ID value...
+            --       This also means that, unlike on sane devices, this will *never* be set to -1 on contact lift,
+            --       which is why we instead have to rely on EV_KEY:BTN_TOUCH:0 for that (c.f., handleKeyBoardEv).
+            if ev.value == -1 then
+                -- NOTE: While *actual* snow_protocol devices will *never* emit an EV_ABS:ABS_MT_TRACKING_ID:-1 event,
+                --       we've seen brand new revisions of snow_protocol devices shipping with sane panels instead,
+                --       so we'll need to disable the quirks at runtime to handle these properly...
+                --       (c.f., https://www.mobileread.com/forums/showpost.php?p=4383629&postcount=997).
+                -- NOTE: Simply skipping the slot storage setup for -1 would not be enough, as it would only fix ST handling.
+                --       MT would be broken, because buddy contact detection in GestureDetector looks at slot +/- 1,
+                --       whereas we'd be having the main contact point at a stupidly large slot number
+                --       (because it would match ABS_MT_TRACKING_ID, given the lack of ABS_MT_SLOT, at least for the first input frame),
+                --       while the second contact would be at slot 1, because it would immediately have required emitting a proper ABS_MT_SLOT event...
+                logger.warn("Input: Disabled snow_protocol quirks because your device's hardware revision doesn't appear to need them!")
+                self.snow_protocol = false
+                self.handleTouchEv = Input.handleTouchEv
+            else
+                self:setupSlotData(ev.value)
+            end
+            self:setCurrentMtSlotChecked("id", ev.value)
+        elseif ev.code == C.ABS_MT_TOOL_TYPE then
+            -- NOTE: On the Elipsa: Finger == 0; Pen == 1
+            self:setCurrentMtSlot("tool", ev.value)
+        -- NOTE: We ignore ABS_X & ABS_Y, as they may be reported for *multiple* contacts on the BTN_TOUCH:0 frame...
+        --       ...without a corresponding ABS_MT_SLOT or ABS_MT_TRACKING_ID, of course... (#11910)
+        elseif ev.code == C.ABS_MT_POSITION_X then
+            self:setCurrentMtSlotChecked("x", ev.value)
+        elseif ev.code == C.ABS_MT_POSITION_Y then
+            self:setCurrentMtSlotChecked("y", ev.value)
+        -- NOTE: Similarly, we can't honor ABS_PRESSURE for the same reason as ABS_X & ABS_Y...
+        end
+    elseif ev.type == C.EV_SYN then
+        if ev.code == C.SYN_REPORT then
+            for _, MTSlot in ipairs(self.MTSlots) do
+                self:setMtSlot(MTSlot.slot, "timev", time.timeval(ev.time))
+            end
+            self:routeStylusEvents()
             -- feed ev in all slots to state machine
             local touch_gestures = self.gesture_detector:feedEvent(self.MTSlots)
             self:newFrame()
@@ -894,7 +1205,7 @@ function Input:handleMixedTouchEv(ev)
 end
 
 function Input:handleTouchEvPhoenix(ev)
-    -- Hack on handleTouchEV for the Kobo Aura
+    -- Hack on handleTouchEv for the Kobo Aura
     -- It seems to be using a custom protocol:
     --        finger 0 down:
     --            input_report_abs(elan_touch_data.input, C.ABS_MT_TRACKING_ID, 0);
@@ -940,6 +1251,7 @@ function Input:handleTouchEvPhoenix(ev)
             for _, MTSlot in ipairs(self.MTSlots) do
                 self:setMtSlot(MTSlot.slot, "timev", time.timeval(ev.time))
             end
+            self:routeStylusEvents()
             -- feed ev in all slots to state machine
             local touch_gestures = self.gesture_detector:feedEvent(self.MTSlots)
             self:newFrame()
@@ -989,6 +1301,7 @@ function Input:handleTouchEvLegacy(ev)
                 self:setMtSlot(MTSlot.slot, "timev", time.timeval(ev.time))
             end
 
+            self:routeStylusEvents()
             -- feed ev in all slots to state machine
             local touch_gestures = self.gesture_detector:feedEvent(self.MTSlots)
             self:newFrame()
@@ -1211,7 +1524,7 @@ function Input:waitEvent(now, deadline)
 
                 local timerfd
                 local sec, usec = time.split_s_us(poll_timeout)
-                ok, ev, timerfd = input.waitForEvent(sec, usec)
+                ok, ev, timerfd = self.input.waitForEvent(sec, usec)
                 -- We got an actual input event, go and process it
                 if ok then break end
 
@@ -1261,7 +1574,7 @@ function Input:waitEvent(now, deadline)
                         -- GestureDetector has guards in place to avoid double frees in case the callback itself
                         -- affected the timerfd or timer_callbacks list (e.g., by dropping a contact).
                         if timerfd then
-                            input.clearTimer(timerfd)
+                            self.input.clearTimer(timerfd)
                         end
                         table.remove(self.timer_callbacks, timer_idx)
 
@@ -1298,7 +1611,7 @@ function Input:waitEvent(now, deadline)
             end
 
             local sec, usec = time.split_s_us(poll_timeout)
-            ok, ev = input.waitForEvent(sec, usec)
+            ok, ev = self.input.waitForEvent(sec, usec)
         end -- if #timer_callbacks > 0
 
         -- Handle errors
@@ -1334,7 +1647,7 @@ function Input:waitEvent(now, deadline)
         for __, event in ipairs(ev) do
             if DEBUG.is_on then
                 -- NOTE: This is rather spammy and computationally intensive,
-                --       and we can't conditionally prevent evalutation of function arguments,
+                --       and we can't conditionally prevent evaluation of function arguments,
                 --       so, just hide the whole thing behind a branch ;).
                 if event.type == C.EV_KEY then
                     logger.dbg(string.format(
@@ -1514,5 +1827,10 @@ function Input:inhibitInputUntil(set_or_seconds)
     UIManager:scheduleIn(delay_s, self._inhibitInputUntil_func)
     self:inhibitInput(true)
 end
+
+Input.TOOL_TYPE_FINGER = TOOL_TYPE_FINGER
+Input.TOOL_TYPE_PEN = TOOL_TYPE_PEN
+Input.TOOL_TYPE_ERASER = TOOL_TYPE_ERASER
+Input.TOOL_TYPE_HIGHLIGHTER = TOOL_TYPE_HIGHLIGHTER
 
 return Input

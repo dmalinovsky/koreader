@@ -95,7 +95,7 @@ end
 
 local function getExternalFontDir()
     if CanvasContext:hasSystemFonts() then
-        return require("frontend/ui/elements/font_settings"):getPath()
+        return require("ui/elements/font_settings"):getPath()
     else
         return os.getenv("EXT_FONT_DIR")
     end
@@ -135,6 +135,8 @@ local font_exts = {
     ["ttc"] = true,
     ["cff"] = true,
     ["otf"] = true,
+    ["woff"] = true,
+    ["woff2"] = true,
 }
 
 function FontList:_readList(dir, mark)
@@ -142,12 +144,10 @@ function FontList:_readList(dir, mark)
         -- See if we're interested
         if file:sub(1, 1) == "." then return end
         local file_type = file:lower():match(".+%.([^.]+)") or ""
-        if not font_exts[file_type] then return end
+        if not font_exts[file_type] or isInFontsBlacklist(file) then return end
 
         -- Add it to the list
-        if not isInFontsBlacklist(file) then
-            table.insert(self.fontlist, path)
-        end
+        table.insert(self.fontlist, path)
 
         -- And into cached info table
         mark[path] = true
@@ -155,7 +155,7 @@ function FontList:_readList(dir, mark)
             return
         end
         local fi = collectFaceInfo(path)
-        if not fi then return end
+        if not fi or not next(fi) then return end
         fi.change = attr.change
         self.fontinfo[path] = fi
         mark.cache_dirty = true

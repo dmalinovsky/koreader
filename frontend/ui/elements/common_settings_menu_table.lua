@@ -8,6 +8,8 @@ local Language = require("ui/language")
 local NetworkMgr = require("ui/network/manager")
 local PowerD = Device:getPowerDevice()
 local UIManager = require("ui/uimanager")
+local filemanagerutil = require("apps/filemanager/filemanagerutil")
+local util = require("util")
 local _ = require("gettext")
 local N_ = _.ngettext
 local C_ = _.pgettext
@@ -17,7 +19,6 @@ local T = require("ffi/util").template
 local common_settings = {}
 
 if Device:isCervantes() then
-    local util = require("util")
     if util.pathExists("/usr/bin/restart.sh") then
         common_settings.start_bq = {
             text = T(_("Start %1 reader app"), "BQ"),
@@ -76,15 +77,15 @@ common_settings.time = {
     text = _("Time and date"),
     sub_item_table = {
         {
-        text = _("12-hour clock"),
-        keep_menu_open = true,
-        checked_func = function()
-            return G_reader_settings:isTrue("twelve_hour_clock")
-        end,
-        callback = function()
-            G_reader_settings:flipNilOrFalse("twelve_hour_clock")
-            UIManager:broadcastEvent(Event:new("TimeFormatChanged"))
-        end,
+            text = _("12-hour clock"),
+            keep_menu_open = true,
+            checked_func = function()
+                return G_reader_settings:isTrue("twelve_hour_clock")
+            end,
+            callback = function()
+                G_reader_settings:flipNilOrFalse("twelve_hour_clock")
+                UIManager:broadcastEvent(Event:new("TimeFormatChanged"))
+            end,
         },
         {
             text_func = function ()
@@ -192,7 +193,7 @@ if Device:setDateTime() then
                 day = curr_day,
                 ok_text = _("Set date"),
                 title_text = _("Set date"),
-                info_text = _("Date is in years, months and days."),
+                info_text = _("The date format is year, month, day."),
                 callback = function(time)
                     now_t = os.date("*t")
                     if Device:setDateTime(time.year, time.month, time.day, now_t.hour, now_t.min, now_t.sec) then
@@ -237,11 +238,23 @@ if Device:isKobo() then
             UIManager:askForRestart()
         end
     }
+
+    if Device:hasKeys() and Device:isMTK() then
+        common_settings.pageturn_power = {
+            text = _("Wake up on page-turn button press"),
+            checked_func = function()
+                return G_reader_settings:isTrue("pageturn_power")
+            end,
+            callback = function()
+                G_reader_settings:flipNilOrFalse("pageturn_power")
+            end
+        }
+    end
 end
 
-if Device:isKindle() and PowerD:hasHallSensor() then
+if PowerD:hasHallSensor() then
     common_settings.cover_events = {
-        text = _("Disable Kindle cover events"),
+        text = _("Disable cover events"),
         help_text = _([[Toggle the Hall effect sensor.
 This is used to detect if the cover is closed, which will automatically sleep and wake the device. If there is no cover present the sensor may cause spurious wakeups when located next to a magnetic source.]]),
         keep_menu_open = true,
@@ -265,10 +278,10 @@ NetworkMgr:getMenuTable(common_settings)
 common_settings.screen = {
     text = _("Screen"),
 }
-common_settings.screen_rotation = require("ui/elements/screen_rotation_menu_table")
-common_settings.screen_dpi = require("ui/elements/screen_dpi_menu_table")
-common_settings.screen_eink_opt = require("ui/elements/screen_eink_opt_menu_table")
-common_settings.screen_notification = require("ui/elements/screen_notification_menu_table")
+common_settings.screen_rotation = dofile("frontend/ui/elements/screen_rotation_menu_table.lua")
+common_settings.screen_dpi = dofile("frontend/ui/elements/screen_dpi_menu_table.lua")
+common_settings.screen_eink_opt = dofile("frontend/ui/elements/screen_eink_opt_menu_table.lua")
+common_settings.screen_notification = dofile("frontend/ui/elements/screen_notification_menu_table.lua")
 
 if Device:isTouchDevice() then
     common_settings.taps_and_gestures = {
@@ -280,20 +293,25 @@ if Device:isTouchDevice() then
             return G_reader_settings:isTrue("ignore_hold_corners")
         end,
         callback = function()
-            UIManager:broadcastEvent(Event:new("IgnoreHoldCorners"))
+            UIManager:broadcastEvent(Event:new("IgnoreHoldCorners", nil, true)) -- no notification
         end,
     }
-    common_settings.screen_disable_double_tab = require("ui/elements/screen_disable_double_tap_table")
-    common_settings.menu_activate = require("ui/elements/menu_activate")
-    common_settings.keyboard_layout = {
-        text = _("Keyboard"),
-        sub_item_table = require("ui/elements/menu_keyboard_layout"),
+    common_settings.screen_disable_double_tap = {
+        text = _("Disable double tap"),
+        checked_func = function()
+            return G_reader_settings:nilOrTrue("disable_double_tap")
+        end,
+        callback = function()
+            G_reader_settings:flipNilOrTrue("disable_double_tap")
+            UIManager:askForRestart()
+        end,
     }
+    common_settings.menu_activate = dofile("frontend/ui/elements/menu_activate.lua")
 end
 
 -- NOTE: Allow disabling color if it's mistakenly enabled on a Grayscale screen (after a settings import?)
 if Screen:isColorEnabled() or Screen:isColorScreen() then
-    common_settings.color_rendering = require("ui/elements/screen_color_menu_table")
+    common_settings.color_rendering = dofile("frontend/ui/elements/screen_color_menu_table.lua")
 end
 
 -- fullscreen toggle for supported devices
@@ -383,13 +401,13 @@ local back_to_exit_str = {
     always = {_("Always"), _("always")},
     disable ={_("Disable"), _("disable")},
 }
-local function genGenericMenuEntry(title, setting, value, default, radiomark)
+local function genGenericMenuEntry(title, setting, value, default)
     return {
         text = title,
         checked_func = function()
             return G_reader_settings:readSetting(setting, default) == value
         end,
-        radio = radiomark,
+        radio = true,
         callback = function()
             G_reader_settings:saveSetting(setting, value)
         end,
@@ -426,6 +444,7 @@ common_settings.back_in_filemanager = {
             checked_func = function()
                 return G_reader_settings:readSetting("back_in_filemanager", "default") == "default"
             end,
+            radio = true,
             callback = function()
                 G_reader_settings:saveSetting("back_in_filemanager", "default")
             end,
@@ -458,6 +477,7 @@ common_settings.back_in_reader = {
             checked_func = function()
                 return G_reader_settings:readSetting("back_in_reader") == "default"
             end,
+            radio = true,
             callback = function()
                 G_reader_settings:saveSetting("back_in_reader", "default")
             end,
@@ -467,7 +487,8 @@ common_settings.back_in_reader = {
         genGenericMenuEntry(_("Go to previous read page"), "back_in_reader", "previous_read_page"),
     },
 }
-if Device:hasKeyboard() then
+-- Kindle keyboard does not have a 'Backspace' key
+if Device:hasKeyboard() and not Device:hasSymKey() then
     common_settings.backspace_as_back = {
         text = _("Backspace works as back button"),
         checked_func = function()
@@ -481,13 +502,30 @@ if Device:hasKeyboard() then
 end
 
 common_settings.opening_page_location_stack = {
-        text = _("Add opening page to location history"),
-        checked_func = function()
-            return G_reader_settings:isTrue("opening_page_location_stack")
-        end,
-        callback = function()
-            G_reader_settings:flipNilOrFalse("opening_page_location_stack")
-        end,
+    text = _("Add opening page to location history"),
+    checked_func = function()
+        return G_reader_settings:isTrue("opening_page_location_stack")
+    end,
+    callback = function()
+        G_reader_settings:flipNilOrFalse("opening_page_location_stack")
+    end,
+}
+
+local skim_dialog_position_string = {
+    top    = _("Top"),
+    center = _("Center"),
+    bottom = _("Bottom"),
+}
+common_settings.skim_dialog_position = {
+    text_func = function()
+        local position = G_reader_settings:readSetting("skim_dialog_position") or "center"
+        return T(_"Skim dialog position: %1", skim_dialog_position_string[position]:lower())
+    end,
+    sub_item_table = {
+        genGenericMenuEntry(skim_dialog_position_string["top"],    "skim_dialog_position", "top"),
+        genGenericMenuEntry(skim_dialog_position_string["center"], "skim_dialog_position", nil), -- default
+        genGenericMenuEntry(skim_dialog_position_string["bottom"], "skim_dialog_position", "bottom"),
+    },
 }
 
 -- Auto-save settings: default value, info text and warning, and menu items
@@ -525,6 +563,7 @@ local function genAutoSaveMenuItem(value)
         checked_func = function()
             return G_reader_settings:readSetting(setting_name) == value
         end,
+        radio = true,
         callback = function()
             G_reader_settings:saveSetting(setting_name, value)
         end,
@@ -552,7 +591,7 @@ local metadata_folder_help_table = {
 }
 local metadata_folder_help_text = table.concat(metadata_folder_help_table, "\n")
 
-local hash_filemod_warn = T(_("%1 requires calculating partial file hashes of documents which may slow down file browser navigation. Any file modifications (such as embedding annotations into PDF files or downloading from calibre) may change the partial hash, thereby losing track of any highlights, bookmarks, and progress data. Embedding PDF annotations is currently set to \"%s\" and can be disabled at (⚙ → Document → Save Document (write highlights into PDF))."), metadata_folder_str.hash)
+local hash_filemod_warn = T(_("%1 requires calculating partial file hashes of documents which may slow down file browser navigation. Any file modifications (such as embedding annotations into PDF files or downloading from calibre) may change the partial hash, thereby losing track of any highlights, bookmarks, and progress data. Embedding PDF annotations can be set at menu Typeset → Highlights → Write highlights into PDF."), metadata_folder_str.hash)
 local leaving_hash_sdr_warn = _("Warning: You currently have documents with hash-based metadata. Until this metadata is moved by opening those documents, or deleted, file browser navigation may remain slower.")
 
 local function genMetadataFolderMenuItem(value)
@@ -567,8 +606,7 @@ local function genMetadataFolderMenuItem(value)
                 G_reader_settings:saveSetting("document_metadata_folder", value)
                 if value == "hash" then
                     DocSettings.setIsHashLocationEnabled(true)
-                    local save_document_setting = G_reader_settings:readSetting("save_document")
-                    UIManager:show(InfoMessage:new{ text = string.format(hash_filemod_warn, save_document_setting), icon = "notice-warning" })
+                    UIManager:show(InfoMessage:new{ text = hash_filemod_warn, icon = "notice-warning" })
                 else
                     DocSettings.setIsHashLocationEnabled(nil) -- reset
                     if DocSettings.isHashLocationEnabled() then
@@ -652,24 +690,76 @@ common_settings.document_auto_save = {
     separator = true,
 }
 
-common_settings.document_save = {
-    text = _("Save document (write highlights into PDF)"),
+local document_metadata_arc_help_text = _([[
+Book metadata (view settings, bookmarks, notes) can be saved to the archive when deleting a book.
+
+If a book is restored on the device, its archived metadata can be used.
+Annotations of deleted books can be viewed in Bookmark browser.
+
+To keep book metadata when deleting a book outside of KOReader, book metadata can be saved to archive on book closing.]])
+common_settings.document_metadata_arc = {
+    text = _("Book metadata archive"),
     sub_item_table = {
-        genGenericMenuEntry(_("Prompt"), "save_document", "prompt", "prompt"), -- set "save_document" to "prompt"
         {
-            text = _("Always"),
-            checked_func = function()
-                return G_reader_settings:readSetting("save_document") == "always"
-            end,
+            text = _("About"),
+            keep_menu_open = true,
             callback = function()
-                if G_reader_settings:readSetting("document_metadata_folder") == "hash" then
-                    UIManager:show(InfoMessage:new{ text = _("Warning: Book metadata location is set to hash-based storage. Writing highlights into a PDF modifies the file which may change the partial hash, resulting in its metadata (e.g., highlights and progress) being unlinked and lost."), icon = "notice-warning"  })
-                end
-                G_reader_settings:saveSetting("save_document", "always")
+                UIManager:show(InfoMessage:new{ text = document_metadata_arc_help_text })
             end,
         },
-        genGenericMenuEntry(_("Disable"), "save_document", "disable"),
+        {
+            text_func = function()
+                return T(_("Archive location: %1"),
+                    G_reader_settings:readSetting("document_metadata_arc_folder") or _("not set"))
+            end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                local title_header = _("Book metadata archive folder:")
+                local current_path = G_reader_settings:readSetting("document_metadata_arc_folder")
+                local caller_callback = function(path)
+                    local ok = true
+                    if path and path ~= current_path then
+                        local FileManager = require("apps/filemanager/filemanager")
+                        util.findFiles(current_path, function(fullpath, filename)
+                            if filename:match("%.lua$") then
+                                ok = FileManager:moveFile(fullpath, path .. "/" .. filename)
+                            elseif filename:match("%.old$") then
+                                os.remove(fullpath)
+                            end
+                        end, false)
+                    end
+                    if ok then
+                        G_reader_settings:saveSetting("document_metadata_arc_folder", path)
+                        touchmenu_instance:updateItems()
+                    end
+                end
+                filemanagerutil.showChooseDialog(title_header, caller_callback, current_path, nil, nil, true)
+            end,
+        },
+        {
+            text = _("Save metadata to archive on book closing"),
+            enabled_func = function()
+                return G_reader_settings:has("document_metadata_arc_folder")
+            end,
+            checked_func = function()
+                return G_reader_settings:isTrue("document_metadata_arc_on_closing")
+            end,
+            callback = function()
+                G_reader_settings:flipNilOrFalse("document_metadata_arc_on_closing")
+            end,
+            separator = true,
+        },
+        {
+            text = _("Archived book list"),
+            enabled_func = function()
+                return G_reader_settings:has("document_metadata_arc_folder")
+            end,
+            callback = function()
+                FileManagerBookInfo:onShowBookMetadataArchive()
+            end,
+        },
     },
+    separator = true,
 }
 
 common_settings.document_end_action = {
@@ -685,14 +775,15 @@ common_settings.document_end_action = {
             end,
             separator = true,
         },
-        genGenericMenuEntry(_("Ask with popup dialog"), "end_document_action", "pop-up", "pop-up", true),
-        genGenericMenuEntry(_("Do nothing"), "end_document_action", "nothing", nil, true),
-        genGenericMenuEntry(_("Book status"), "end_document_action", "book_status", nil, true),
-        genGenericMenuEntry(_("Delete file"), "end_document_action", "delete_file", nil, true),
+        genGenericMenuEntry(_("Ask with popup dialog"), "end_document_action", "pop-up", "pop-up"),
+        genGenericMenuEntry(_("Do nothing"), "end_document_action", "nothing", nil),
+        genGenericMenuEntry(_("Book status"), "end_document_action", "book_status", nil),
+        genGenericMenuEntry(_("Delete file"), "end_document_action", "delete_file", nil),
         {
             text = _("Open next file"),
             enabled_func = function()
-                return G_reader_settings:readSetting("collate") ~= "access"
+                local collate = G_reader_settings:readSetting("collate")
+                return collate ~= "access" and collate ~= "date"
             end,
             checked_func = function()
                 return G_reader_settings:readSetting("end_document_action") == "next_file"
@@ -702,10 +793,10 @@ common_settings.document_end_action = {
                 G_reader_settings:saveSetting("end_document_action", "next_file")
             end,
         },
-        genGenericMenuEntry(_("Go to beginning"), "end_document_action", "goto_beginning", nil, true),
-        genGenericMenuEntry(_("Return to file browser"), "end_document_action", "file_browser", nil, true),
-        genGenericMenuEntry(_("Mark book as finished"), "end_document_action", "mark_read", nil, true),
-        genGenericMenuEntry(_("Book status and return to file browser"), "end_document_action", "book_status_file_browser", nil, true),
+        genGenericMenuEntry(_("Go to beginning"), "end_document_action", "goto_beginning", nil),
+        genGenericMenuEntry(_("Return to file browser"), "end_document_action", "file_browser", nil),
+        genGenericMenuEntry(_("Mark book as finished"), "end_document_action", "mark_read", nil),
+        genGenericMenuEntry(_("Book status and return to file browser"), "end_document_action", "book_status_file_browser", nil),
     }
 }
 
@@ -715,32 +806,47 @@ common_settings.device = {
     text = _("Device"),
 }
 
-common_settings.font_ui_fallbacks = require("ui/elements/font_ui_fallbacks")
+common_settings.keyboard_layout = {
+    text = _("Keyboard"),
+    sub_item_table = dofile("frontend/ui/elements/menu_keyboard_layout.lua"),
+}
+
+common_settings.font_ui_fallbacks = dofile("frontend/ui/elements/font_ui_fallbacks.lua")
 
 common_settings.units = {
-    text = _("Units"),
+    text_func = function()
+        local unit = G_reader_settings:readSetting("dimension_units", "mm")
+        return T(_("Dimension units: %1"), unit)
+    end,
     sub_item_table = {
         {
-            text = _("Metric length"),
+            text = _("Also show values in pixels"),
             checked_func = function()
-                return G_reader_settings:readSetting("metric_length", true)
+                return G_reader_settings:isTrue("dimension_units_append_px")
             end,
-            callback = function(touchmenu_instance)
-                G_reader_settings:toggle("metric_length")
-                if touchmenu_instance then touchmenu_instance:updateItems() end
+            enabled_func = function()
+                return G_reader_settings:readSetting("dimension_units") ~= "px"
             end,
-            keep_menu_open = true,
+            callback = function()
+                G_reader_settings:flipNilOrFalse("dimension_units_append_px")
+            end,
+            separator = true,
         },
-    },
+        genGenericMenuEntry(_("Metric system"),   "dimension_units", "mm", nil),
+        genGenericMenuEntry(_("Imperial system"), "dimension_units", "in", nil),
+        genGenericMenuEntry(_("Pixels"),          "dimension_units", "px", nil),
+    }
 }
 
-common_settings.screenshot = {
-    text = _("Screenshot folder"),
-    callback = function()
-        local Screenshoter = require("ui/widget/screenshoter")
-        Screenshoter:chooseFolder()
-    end,
-    keep_menu_open = true,
-}
+if Device:isTouchDevice() or Device:hasKeyboard() or Device:hasScreenKB() then
+    common_settings.screenshot = {
+        text = _("Screenshot folder"),
+        callback = function()
+            local Screenshoter = require("ui/widget/screenshoter")
+            Screenshoter:chooseFolder()
+        end,
+        keep_menu_open = true,
+    }
+end
 
 return common_settings

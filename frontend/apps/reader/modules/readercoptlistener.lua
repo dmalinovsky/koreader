@@ -12,6 +12,10 @@ local ReaderCoptListener = EventListener:extend{}
 
 local CRE_HEADER_DEFAULT_SIZE = 20
 
+function ReaderCoptListener:init()
+    self.additional_header_content = {} -- place, where additional header content can be inserted.
+end
+
 function ReaderCoptListener:onReadSettings(config)
     local view_mode_name = self.document.configurable.view_mode == 0 and "page" or "scroll"
     -- Let crengine know of the view mode before rendering, as it can
@@ -21,8 +25,8 @@ function ReaderCoptListener:onReadSettings(config)
     -- ReaderView is the holder of the view_mode state
     self.view.view_mode = view_mode_name
 
-    -- crengine top status bar can only show author and title together
     self.title = G_reader_settings:readSetting("cre_header_title", 1)
+    self.author = G_reader_settings:readSetting("cre_header_author", 1)
     self.clock = G_reader_settings:readSetting("cre_header_clock", 1)
     self.header_auto_refresh = G_reader_settings:readSetting("cre_header_auto_refresh", 1)
     self.page_number = G_reader_settings:readSetting("cre_header_page_number", 1)
@@ -33,6 +37,7 @@ function ReaderCoptListener:onReadSettings(config)
     self.chapter_marks = G_reader_settings:readSetting("cre_header_chapter_marks", 1)
 
     self.document._document:setIntProperty("window.status.title", self.title)
+    self.document._document:setIntProperty("window.status.author", self.author)
     self.document._document:setIntProperty("window.status.clock", self.clock)
     self.document._document:setIntProperty("window.status.pos.page.number", self.page_number)
     self.document._document:setIntProperty("window.status.pos.page.count", self.page_count)
@@ -40,6 +45,12 @@ function ReaderCoptListener:onReadSettings(config)
     self.document._document:setIntProperty("window.status.battery", self.battery)
     self.document._document:setIntProperty("window.status.battery.percent", self.battery_percent)
     self.document._document:setIntProperty("window.status.pos.percent", self.reading_percent)
+
+    -- We will build the top status bar page info string ourselves,
+    -- if we have to display any chunk of it
+    self.page_info_override = self.page_number == 1 or self.page_count == 1 or self.reading_percent == 1
+        or (self.battery == 1 and self.battery_percent == 1) -- don't forget a sole battery
+    self.document:setPageInfoOverride("") -- an empty string lets crengine display its own page info
 
     self:onTimeFormatChanged()
 
@@ -74,6 +85,135 @@ function ReaderCoptListener:onReaderReady()
             self.document:setAltDocumentProp(prop_key, custom_prop_value)
         end
     end
+end
+
+function ReaderCoptListener:updatePageInfoOverride(pageno)
+    if self.document.configurable.status_line ~= 0 or self.view.view_mode ~= "page" -- no alt status bar
+        or not (self.page_info_override or next(self.additional_header_content)) -- no items to override
+    then
+        self.document:setPageInfoOverride("")
+        return
+    end
+
+    -- There are a few cases where we may not be updated on change, at least:
+    -- - when changing footer's nb of digits after decimal point
+    -- but we will update on next page turn. Let's not bother.
+    pageno = pageno or self.view.footer.pageno
+    local page_pre = ""
+    local page_number = pageno
+    local page_sep = " / "
+    local page_count = self.ui.document:getPageCount()
+    local page_post = ""
+    local percentage = page_number / page_count
+    local percentage_pre = ""
+    local percentage_post = ""
+    -- Let's use the same setting for nb of digits after decimal point as configured for the footer
+    local percentage_digits =  self.ui.view.footer.settings.progress_pct_format
+    local percentage_fmt = "%." .. percentage_digits .. "f%%"
+
+    -- We want the same output as with ReaderFooter's page_progress() and percentage()
+    -- but here each item (page number, page counte, percentage) is individually toggable,
+    -- so try to get something that make sense when not all are enabled
+    if self.ui.pagemap and self.ui.pagemap:wantsPageLabels() then
+        page_number = self.ui.pagemap:getCurrentPageLabel(true)
+        page_count = self.ui.pagemap:getLastPageLabel(true)
+    elseif self.ui.document:hasHiddenFlows() then
+        local flow = self.ui.document:getPageFlow(pageno)
+        page_number = self.ui.document:getPageNumberInFlow(pageno)
+        page_count = self.ui.document:getTotalPagesInFlow(flow)
+        percentage = page_number / page_count
+        if flow == 0 then
+            page_sep = " // "
+        else
+            page_pre = "["
+            page_post = "]" .. flow
+            percentage_pre = "["
+            percentage_post = "]"
+        end
+    end
+
+    local additional_content = ""
+    for dummy, v in ipairs(self.additional_header_content) do
+        local value = v()
+        if value and value ~= "" then
+            additional_content = additional_content .. value
+            if self.page_number == 1 or self.page_count == 1 then
+                additional_content = additional_content .. "  " -- double spaces as crengine's own drawing
+            end
+        end
+    end
+
+    local page_info = ""
+    if self.page_number == 1 or self.page_count == 1 then
+        page_info = page_info .. page_pre
+        if self.page_number == 1 then
+            page_info = page_info .. page_number
+            if self.page_count == 1 then
+                page_info = page_info .. page_sep
+            end
+        end
+        if self.page_count == 1 then
+            page_info = page_info .. page_count
+        end
+        page_info = page_info .. page_post
+        if self.reading_percent == 1 then
+            page_info = page_info .. "  " -- (double space as done by crengine's own drawing)
+        end
+    end
+    if self.reading_percent == 1 then
+        page_info = page_info .. percentage_pre .. percentage_fmt:format(percentage*100) .. percentage_post
+    end
+
+    if self.battery == 1 and self.battery_percent == 1 then -- append battery percentage
+        local batt_pre = "["
+        local batt_post = "]"
+        local batt_val = nil
+        if Device:hasBattery() then
+            local powerd = Device:getPowerDevice()
+            local batt_lvl = powerd:getCapacity()
+
+            if Device:hasAuxBattery() and powerd:isAuxBatteryConnected() then
+                local aux_batt_lvl = powerd:getAuxCapacity()
+                if powerd:isAuxCharging() then
+                    batt_pre = "[\u{21AF}" -- ↯-symbol
+                end
+                -- Sum both batteries for the actual text
+                batt_lvl = batt_lvl + aux_batt_lvl
+            else
+                if powerd:isCharging() then
+                    batt_pre = "[\u{21AF}" -- ↯-symbol
+                end
+            end
+            batt_val = string.format("%2d%%", batt_lvl)
+        end
+
+        if batt_val then
+            local battery_info = "  " .. batt_pre .. batt_val .. batt_post
+            --                     ^--- (double space as done by crengine's own drawing)
+            page_info = page_info .. battery_info
+        end
+    end
+
+    if not self.page_info_override and additional_content ~= "" then
+        -- force showing additional content when other overridden items are disabled
+        self.document._document:setIntProperty("window.status.pos.page.number", 1)
+    else
+        self.document._document:setIntProperty("window.status.pos.page.number", self.page_number)
+    end
+    self.document:setPageInfoOverride(additional_content .. page_info)
+end
+
+function ReaderCoptListener:onPageUpdate(pageno)
+    self:updatePageInfoOverride(pageno)
+end
+
+function ReaderCoptListener:onPosUpdate(pos, pageno)
+    self:updatePageInfoOverride(pageno)
+end
+
+function ReaderCoptListener:onUsePageLabelsUpdated()
+    self:updatePageInfoOverride()
+    self:updateHeader()
 end
 
 function ReaderCoptListener:onBookMetadataChanged(prop_updated)
@@ -188,9 +328,33 @@ end
 ReaderCoptListener.onCloseDocument = ReaderCoptListener.unscheduleHeaderRefresh
 ReaderCoptListener.onSuspend = ReaderCoptListener.unscheduleHeaderRefresh
 
+function ReaderCoptListener:addAdditionalHeaderContent(content_func)
+    table.insert(self.additional_header_content, content_func)
+end
+
+function ReaderCoptListener:removeAdditionalHeaderContent(content_func)
+    for i, v in ipairs(self.additional_header_content) do
+        if v == content_func then
+            table.remove(self.additional_header_content, i)
+            if #self.additional_header_content == 0 then
+                self.document._document:setIntProperty("window.status.pos.page.number", self.page_number)
+            end
+            return
+        end
+    end
+end
+
 function ReaderCoptListener:setAndSave(setting, property, value)
     self.document._document:setIntProperty(property, value)
     G_reader_settings:saveSetting(setting, value)
+    self:onUpdateHeader()
+end
+
+function ReaderCoptListener:onUpdateHeader()
+    self.page_info_override = self.page_number == 1 or self.page_count == 1 or self.reading_percent == 1
+        or (self.battery == 1 and self.battery_percent == 1) -- don't forget a sole battery
+
+    self:updatePageInfoOverride()
     -- Have crengine redraw it (even if hidden by the menu at this time)
     self.ui.rolling:updateBatteryState()
     self:updateHeader()
@@ -211,7 +375,7 @@ function ReaderCoptListener:getAltStatusBarMenu()
         separator = true,
         sub_item_table = {
             {
-                text = _("About alternate status bar"),
+                text = _("About alt status bar"),
                 keep_menu_open = true,
                 callback = function()
                     UIManager:show(InfoMessage:new{
@@ -233,13 +397,23 @@ function ReaderCoptListener:getAltStatusBarMenu()
                 separator = true
             },
             {
-                text = _("Book author and title"),
+                text = _("Book title"),
                 checked_func = function()
                     return self.title == 1
                 end,
                 callback = function()
                     self.title = self.title == 0 and 1 or 0
                     self:setAndSave("cre_header_title", "window.status.title", self.title)
+                end,
+            },
+            {
+                text = _("Book author"),
+                checked_func = function()
+                    return self.author == 1
+                end,
+                callback = function()
+                    self.author = self.author == 0 and 1 or 0
+                    self:setAndSave("cre_header_author", "window.status.author", self.author)
                 end,
             },
             {
@@ -294,15 +468,18 @@ function ReaderCoptListener:getAltStatusBarMenu()
             },
             {
                 text_func = function()
-                    local status = _("off")
+                    local status = _("Battery status")
                     if self.battery == 1 then
                         if self.battery_percent == 1 then
-                            status = _("percentage")
+                            status = _("Battery status: percentage")
                         else
-                            status = _("icon")
+                            status = _("Battery status: icon")
                         end
                     end
-                    return T(_("Battery status: %1"), status)
+                    return status
+                end,
+                checked_func = function()
+                    return self.battery == 1
                 end,
                 sub_item_table = {
                     {

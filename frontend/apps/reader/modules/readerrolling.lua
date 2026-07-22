@@ -95,12 +95,12 @@ function ReaderRolling:init()
             -- We loaded from a valid cache file: remember its hash. It may allow not
             -- having to do any background rerendering if the user somehow reverted
             -- some setting changes before any background rerendering had completed
-            -- (ie. with autorotation, transitionning from portrait to landscape for
+            -- (ie. with autorotation, transitioning from portrait to landscape for
             -- a few seconds, to then end up back in portrait).
             self.valid_cache_rendering_hash = self.ui.document:getDocumentRenderingHash(false)
         end
     end)
-    table.insert(self.ui.postReaderCallback, function()
+    table.insert(self.ui.postReaderReadyCallback, function()
         self:updatePos()
         -- Disable crengine internal history, with required redraw
         self.ui.document:enableInternalHistory(false)
@@ -116,81 +116,41 @@ end
 function ReaderRolling:onGesture() end
 
 function ReaderRolling:registerKeyEvents()
-    if Device:hasKeys() then
-        self.key_events.GotoNextView = {
-            { { "RPgFwd", "LPgFwd", "Right" } },
-            event = "GotoViewRel",
-            args = 1,
-        }
-        self.key_events.GotoPrevView = {
-            { { "RPgBack", "LPgBack", "Left" } },
-            event = "GotoViewRel",
-            args = -1,
-        }
+    local prev_key, next_key = "Left", "Right"
+    if BD.mirroredUILayout() then
+        next_key, prev_key = prev_key, next_key
     end
-    if Device:hasDPad() then
-        self.key_events.MoveUp = {
-            { "Up" },
-            event = "Panning",
-            args = {0, -1},
-        }
-        self.key_events.MoveDown = {
-            { "Down" },
-            event = "Panning",
-            args = {0,  1},
-        }
+    if Device:hasDPad() and Device:useDPadAsActionKeys() then
+        if G_reader_settings:isTrue("left_right_keys_turn_pages") then
+            self.key_events.GotoNextView = { { { "LPgFwd", next_key } }, event = "GotoViewRel", args = 1, }
+            self.key_events.GotoPrevView = { { { "LPgBack", prev_key } }, event = "GotoViewRel", args = -1, }
+        elseif G_reader_settings:nilOrFalse("left_right_keys_turn_pages") then
+            self.key_events.GotoNextChapter = { { next_key }, event = "GotoNextChapter", args = 1, }
+            self.key_events.GotoPrevChapter = { { prev_key }, event = "GotoPrevChapter", args = -1, }
+            self.key_events.GotoNextView = { { "LPgFwd" }, event = "GotoViewRel", args = 1, }
+            self.key_events.GotoPrevView = { { "LPgBack" }, event = "GotoViewRel", args = -1, }
+        end
+        self.key_events.MoveUp = { { "RPgBack" }, event = "Panning", args = {0, -1}, }
+        self.key_events.MoveDown = { { { "RPgFwd", " " } }, event = "Panning", args = {0,  1}, }
+    elseif Device:hasDPad() then
+        self.key_events.MoveUp = { { "Up" }, event = "Panning", args = {0, -1}, }
+        self.key_events.MoveDown = { { "Down" }, event = "Panning", args = {0,  1}, }
     end
-    if Device:hasKeyboard() then
-        self.key_events.GotoFirst = {
-            { "1" },
-            event = "GotoPercent",
-            args = 0,
-        }
-        self.key_events.Goto11 = {
-            { "2" },
-            event = "GotoPercent",
-            args = 11,
-        }
-        self.key_events.Goto22 = {
-            { "3" },
-            event = "GotoPercent",
-            args = 22,
-        }
-        self.key_events.Goto33 = {
-            { "4" },
-            event = "GotoPercent",
-            args = 33,
-        }
-        self.key_events.Goto44 = {
-            { "5" },
-            event = "GotoPercent",
-            args = 44,
-        }
-        self.key_events.Goto55 = {
-            { "6" },
-            event = "GotoPercent",
-            args = 55,
-        }
-        self.key_events.Goto66 = {
-            { "7" },
-            event = "GotoPercent",
-            args = 66,
-        }
-        self.key_events.Goto77 = {
-            { "8" },
-            event = "GotoPercent",
-            args = 77,
-        }
-        self.key_events.Goto88 = {
-            { "9" },
-            event = "GotoPercent",
-            args = 88,
-        }
-        self.key_events.GotoLast = {
-            { "0" },
-            event = "GotoPercent",
-            args = 100,
-        }
+    if (Device:hasDPad() and not Device:useDPadAsActionKeys()) or (Device:hasKeys() and not Device:useDPadAsActionKeys()) then
+        self.key_events.GotoNextView = { { { "RPgFwd", "LPgFwd", next_key } }, event = "GotoViewRel", args = 1, }
+        self.key_events.GotoPrevView = { { { "RPgBack", "LPgBack", prev_key } }, event = "GotoViewRel", args = -1, }
+    end
+    if Device:hasKeyboard() and not Device.k3_alt_plus_key_kernel_translated then
+        self.key_events.GotoFirst = { { "1" }, event = "GotoPercent", args = 0,   }
+        self.key_events.Goto11    = { { "2" }, event = "GotoPercent", args = 11,  }
+        self.key_events.Goto22    = { { "3" }, event = "GotoPercent", args = 22,  }
+        self.key_events.Goto33    = { { "4" }, event = "GotoPercent", args = 33,  }
+        self.key_events.Goto44    = { { "5" }, event = "GotoPercent", args = 44,  }
+        self.key_events.Goto55    = { { "6" }, event = "GotoPercent", args = 55,  }
+        self.key_events.Goto66    = { { "7" }, event = "GotoPercent", args = 66,  }
+        self.key_events.Goto77    = { { "8" }, event = "GotoPercent", args = 77,  }
+        self.key_events.Goto88    = { { "9" }, event = "GotoPercent", args = 88,  }
+        self.key_events.Goto99    = { { "0" }, event = "GotoPercent", args = 100, }
     end
 end
 
@@ -234,7 +194,7 @@ function ReaderRolling:onReadSettings(config)
         -- And check if we can migrate to a newest DOM version after
         -- the book is loaded (unless the user told us not to).
         if config:nilOrFalse("cre_keep_old_dom_version") then
-            self.ui:registerPostReadyCallback(function()
+            self.ui:registerPostReaderReadyCallback(function()
                 self:checkXPointersAndProposeDOMVersionUpgrade()
             end)
         end
@@ -326,8 +286,6 @@ function ReaderRolling:onCloseDocument()
     UIManager:unschedule(self.onUpdatePos)
 
     self.current_header_height = nil -- show unload progress bar at top
-    -- we cannot do it in onSaveSettings() because getLastPercent() uses self.ui.document
-    self.ui.doc_settings:saveSetting("percent_finished", self:getLastPercent())
 
     local cache_file_path = self.ui.document:getCacheFilePath() -- nil if no cache file
     self.ui.doc_settings:saveSetting("cache_file_path", cache_file_path)
@@ -352,28 +310,32 @@ end
 
 function ReaderRolling:onCheckDomStyleCoherence()
     if self.ui.document and self.ui.document:isBuiltDomStale() then
-        local has_bookmarks_warn_txt = ""
         -- When using an older DOM version, bookmarks may break
-        if self.using_non_normalized_xpointers and self.ui.bookmark:hasBookmarks() then
-            has_bookmarks_warn_txt = _("\nNote that this change in styles may render your bookmarks or highlights no more valid.\nIf some of them do not show anymore, you can just revert the change you just made to have them shown again.\n\n")
-        end
-        UIManager:show(ConfirmBox:new{
-            text = T(_("Styles have changed in such a way that fully reloading the document may be needed for a correct rendering.\n%1Do you want to reload the document?"), has_bookmarks_warn_txt),
-            ok_callback = function()
-                -- Allow for ConfirmBox to be closed before showing
-                -- "Opening file" InfoMessage
-                UIManager:scheduleIn(0.5, function()
-                    -- And check we haven't quit reader in these 0.5s
-                    if self.ui.document then
-                        self.ui:reloadDocument()
-                    end
-                end)
-            end,
-        })
+        local bookmarks_warn_txt = self.using_non_normalized_xpointers and self.ui.annotation:hasAnnotations()
+            and ("\n" .. _("Note that this change in styles may render your bookmarks or highlights invalid.\nIf some of them no longer appear, you can simply revert the change you just made to show them again.") .. "\n\n")
+        self:showSuggestReloadConfirmBox(bookmarks_warn_txt)
     end
 end
 
+function ReaderRolling:showSuggestReloadConfirmBox(warn_txt)
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Styles have changed in such a way that fully reloading the document may be needed for a correct rendering.\n%1Do you want to reload the document?"),
+            warn_txt or ""),
+        ok_callback = function()
+            -- Allow for ConfirmBox to be closed before showing
+            -- "Opening file" InfoMessage
+            UIManager:scheduleIn(0.5, function()
+                -- And check we haven't quit reader in these 0.5s
+                if self.ui.document then
+                    self.ui:reloadDocument()
+                end
+            end)
+        end,
+    })
+end
+
 function ReaderRolling:onSaveSettings()
+    self.ui.doc_settings:saveSetting("percent_finished", self.view.footer.percent_finished)
     self.ui.doc_settings:delSetting("last_percent") -- deprecated
     self.ui.doc_settings:saveSetting("last_xpointer", self.xpointer)
     self.ui.doc_settings:saveSetting("hide_nonlinear_flows", self.hide_nonlinear_flows)
@@ -616,7 +578,7 @@ function ReaderRolling:onPan(_, ges)
             -- Mouse wheel generates a Pan event: in page mode, move one
             -- page per event. Scroll mode is handled in the 'else' branch
             -- and use the wheeled distance.
-            UIManager:broadcastEvent(Event:new("GotoViewRel", -1 * ges.mousewheel_direction))
+            self:onGotoViewRel(-1 * ges.mousewheel_direction)
         elseif self.view.view_mode == "scroll" then
             if not self._pan_started then
                 self._pan_started = true
@@ -885,7 +847,7 @@ function ReaderRolling:onGotoXPointer(xp, marker_xp)
                 -- rectangle to unmark it; but it might not always be just white
                 -- margin: when we're in dual page mode and crengine has drawn a
                 -- vertical pages separator - or if we have had crengine draw
-                -- some backgroud texture with credocument:setBackgroundImage().
+                -- some background texture with credocument:setBackgroundImage().
                 if self.mark_orig_content_bb then
                     -- be sure we don't leak memory if a previous one is still
                     -- hanging around
@@ -984,13 +946,16 @@ function ReaderRolling:onGotoViewRel(diff)
     if self.ui.document ~= nil then
         self.xpointer = self.ui.document:getXPointer()
     end
+    if self.ui.keyselection:isActive() then
+        self.ui.keyselection:pageTurnDuringSelection()
+    end
     return true
 end
 
 function ReaderRolling:onPanning(args, _)
     local _, dy = unpack(args)
     if self.view.view_mode ~= "scroll" then
-        UIManager:broadcastEvent(Event:new("GotoViewRel", dy))
+        self:onGotoViewRel(dy)
         return
     end
     self:_gotoPos(self.current_pos + dy * self.panning_steps.normal)
@@ -1012,8 +977,8 @@ function ReaderRolling:onBatchedUpdateDone()
     if self.batched_update_count <= 0 then
         self.batched_update_count = 0
         -- Be sure any Notification gets a chance to be painted before
-        -- a blocking rerendering
-        UIManager:nextTick(self.onUpdatePos, self)
+        -- a blocking rerendering (:nextTick() is not enough)
+        UIManager:tickAfterNext(self.onUpdatePos, self)
     end
 end
 
@@ -1029,9 +994,9 @@ function ReaderRolling:onUpdatePos(force)
     if self.batched_update_count > 0 then
         return
     end
-    if self.ui.postReaderCallback ~= nil then -- ReaderUI:init() not yet done
+    if self.ui.postReaderReadyCallback ~= nil then -- ReaderUI:init() not yet done
         -- Don't schedule any updatePos as long as ReaderUI:init() is
-        -- not finished (one will be called in the ui.postReaderCallback
+        -- not finished (one will be called in the ui.postReaderReadyCallback
         -- we have set above) to avoid multiple refreshes.
         return true
     end
@@ -1074,6 +1039,8 @@ function ReaderRolling:updatePos(force)
         if self.ui.document:isRerenderingDelayed(true) then
             -- Partial rerendering is enabled, rerendering is delayed
             logger.dbg("  but rendering delayed, will do partial renderings on draw")
+            -- annotation page numbers must be updated after self.ui:reloadDocument()
+            self.ui.doc_settings:makeTrue("annotations_externally_modified")
             self:handleRenderingDelayed()
             return
         end
@@ -1129,7 +1096,7 @@ function ReaderRolling:onRedrawCurrentView()
 end
 
 function ReaderRolling:onSetDimensions(dimen)
-    if self.ui.postReaderCallback ~= nil then
+    if self.ui.postReaderReadyCallback ~= nil then
         -- ReaderUI:init() not yet done: just set document dimensions
         self.ui.document:setViewDimen(Screen:getSize())
         -- (what's done in the following else is done elsewhere by
@@ -1190,7 +1157,7 @@ function ReaderRolling:_gotoPos(new_pos, do_dim_area)
         self.ui:handleEvent(Event:new("PageChangeAnimation", new_pos > self.current_pos))
     end
     self.ui.document:gotoPos(new_pos)
-    -- The current page we get in scroll mode may be a bit innacurate,
+    -- The current page we get in scroll mode may be a bit inaccurate,
     -- but we give it anyway to onPosUpdate so footer and statistics can
     -- keep up with page.
     self.current_page = self.ui.document:getCurrentPage()
@@ -1283,7 +1250,7 @@ function ReaderRolling:onSetStatusLine(status_line)
     self.cre_top_bar_enabled = status_line == 0
     -- (We used to toggle the footer when toggling the top status bar,
     -- but people seem to like having them both, and it feels more
-    -- practicable to have the independant.)
+    -- practicable to have the independent.)
     self:onUpdatePos()
 end
 
@@ -1445,25 +1412,12 @@ function ReaderRolling:checkXPointersAndProposeDOMVersionUpgrade()
     local applyFuncToXPointersSlots = function(func)
         -- Last position
         func(self, "xpointer", "last position in book")
-        -- Bookmarks
-        if self.ui.bookmark and self.ui.bookmark.bookmarks and #self.ui.bookmark.bookmarks > 0 then
+        -- Annotations
+        if self.ui.annotation and self.ui.annotation.annotations and #self.ui.annotation.annotations > 0 then
             local slots = { "page", "pos0", "pos1" }
-            for _, bookmark in ipairs(self.ui.bookmark.bookmarks) do
+            for _, item in ipairs(self.ui.annotation.annotations) do
                 for _, slot in ipairs(slots) do
-                    func(bookmark, slot, bookmark.notes or "bookmark")
-                end
-            end
-        end
-        -- Highlights
-        if self.view.highlight and self.view.highlight.saved then
-            local slots = { "pos0", "pos1" }
-            for page, items in pairs(self.view.highlight.saved) do
-                if items and #items > 0 then
-                    for _, highlight in ipairs(items) do
-                        for _, slot in ipairs(slots) do
-                            func(highlight, slot, highlight.text or "highlight")
-                        end
-                    end
+                    func(item, slot, item.text or "annotation")
                 end
             end
         end
@@ -1509,6 +1463,9 @@ function ReaderRolling:checkXPointersAndProposeDOMVersionUpgrade()
         local new_xp = normalized_xpointers[xp]
         if new_xp then
             obj[slot] = new_xp
+            if slot == "page" then
+                self.ui.annotation:updateItemByXPointer(obj)
+            end
         else
             -- Let lost/not-found XPointer be. There is a small chance that
             -- it will be found (it it was made before the boxing code moved
@@ -1733,7 +1690,7 @@ function ReaderRolling:handlePartialRerendering()
 end
 
 function ReaderRolling:_waitOrKillCurrentRerenderingSubprocess(wait, kill)
-    -- No need for an asynchronous collector: we'll explicitely call this and wait
+    -- No need for an asynchronous collector: we'll explicitly call this and wait
     -- before going on, even when reloading, to avoid having multiple possibly huge
     -- subprocesses at the same time.
     -- Returns true if the process is no longer running.
@@ -1917,7 +1874,7 @@ function ReaderRolling:setupRerenderingAutomation()
         if self.rendering_state ~= prev_state then
             logger.dbg("_stepRerenderingAutomation", prev_state, ">", self.rendering_state)
             -- Have ReaderView redraw and refresh ReaderFlipping and our state icon, avoiding flashes
-            UIManager:setDirty(self.view.dialog, "ui", self.view.flipping.dimen)
+            UIManager:setDirty(self.view.dialog, "ui", self.view.flipping:getRefreshRegion())
         end
         if reschedule then
             UIManager:scheduleIn(1, self._stepRerenderingAutomation)
@@ -1965,7 +1922,7 @@ function ReaderRolling:_rerenderInBackground()
         -- (which happens when CSS properties "display:" and "white-space:" have changed for some nodes, which
         -- is rather rare with our style tweaks) here, and do the reload and rerendering in this same background
         -- subprocess, and doing this would hide this whole thing from the user, making the UX seamless.
-        -- But this would need a lot more memory, as we would then have 2 independant DOM in memory.
+        -- But this would need a lot more memory, as we would then have 2 independent DOM in memory.
         -- Ie. with a big book and KOReader taking 120 MB, the subprocess would additionally use:
         -- - 60 MB when doing a simple rerendering
         -- - 130 MB when doing a full load+render

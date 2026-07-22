@@ -133,6 +133,13 @@ function VirtualKey:init()
             self.ignore_key_release = true -- don't have delChar called on release
             self.keyboard:delToStartOfLine()
         end
+        self.swipe_callback = function(ges)
+            if ges.direction == "west" then
+                self.keyboard:delWord(true) -- left to cursor
+            elseif ges.direction == "north" then
+                self.keyboard:delWord()
+            end
+        end
         --self.skiphold = true
     elseif self.label == "←" then
         self.callback = function() self.keyboard:leftChar() end
@@ -437,7 +444,9 @@ function VirtualKey:onHoldSelect()
 end
 
 function VirtualKey:onSwipeKey(arg, ges)
-    if G_reader_settings:isFalse("keyboard_swipes_enabled") then return true end
+    if G_reader_settings:isFalse("keyboard_swipes_enabled") then
+        return self:onTapSelect()
+    end
     Device:performHapticFeedback("KEYBOARD_TAP")
     if self.flash_keyboard then
         self:invert(true)
@@ -772,7 +781,7 @@ end
 
 local VirtualKeyboard = FocusManager:extend{
     name = "VirtualKeyboard",
-    visible = nil,
+    visible = false,
     lock_visibility = false,
     covers_footer = true,
     modal = true,
@@ -799,6 +808,7 @@ local VirtualKeyboard = FocusManager:extend{
         ar = "ar_keyboard",
         bg_BG = "bg_keyboard",
         bn = "bn_keyboard",
+        cs = "cs_keyboard",
         da = "da_keyboard",
         de = "de_keyboard",
         el = "el_keyboard",
@@ -807,15 +817,18 @@ local VirtualKeyboard = FocusManager:extend{
         fa = "fa_keyboard",
         fr = "fr_keyboard",
         he = "he_keyboard",
+        hu = "hu_keyboard",
         ja = "ja_keyboard",
         ka = "ka_keyboard",
         ko_KR = "ko_KR_keyboard",
+        ml = "ml_keyboard",
         nb_NO = "no_keyboard",
         pl = "pl_keyboard",
         pt_BR = "pt_keyboard",
         ro = "ro_keyboard",
         ru = "ru_keyboard",
         sk = "sk_keyboard",
+        sr = "sr_keyboard",
         sv = "sv_keyboard",
         th = "th_keyboard",
         tr = "tr_keyboard",
@@ -858,30 +871,13 @@ function VirtualKeyboard:init()
     if keyboard.wrapInputBox then
         self.uwrap_func = keyboard.wrapInputBox(self.inputbox) or self.uwrap_func
     end
-    if Device:hasDPad() then
-        -- hadDPad() would have FocusManager handle arrow keys strokes to navigate
-        -- and activate this VirtualKeyboard's touch keys (needed on non-touch Kindle).
-        -- If we have a keyboard, we'd prefer arrow keys (and Enter, and Del) to be
-        -- handled by InputText to navigate the cursor inside the text box, and to
-        -- add newline and delete chars. And if we are a touch device, we don't
-        -- need focus manager to help us navigate keys and fields.
-        -- So, disable all key_event handled by FocusManager
-        if Device:isTouchDevice() then
-            -- Remove all FocusManager key event handlers.
-            for k, _ in pairs(self.builtin_key_events) do
+    if Device:hasDPad() and Device:hasKeyboard() then
+        -- Use physical keyboard for most characters
+        -- For special characters not available in physical keyboard
+        -- Use arrow and Press keys to select in VirtualKeyboard
+        for k, seq in pairs(self.extra_key_events) do
+            if self:_isTextKeyWithoutModifier(seq) then
                 self.key_events[k] = nil
-            end
-            for k, _ in pairs(self.extra_key_events) do
-                self.key_events[k] = nil
-            end
-        elseif Device:hasKeyboard() then
-            -- Use physical keyboard for most characters
-            -- For special characters not available in physical keyboard
-            -- Use arrow and Press keys to select in VirtualKeyboard
-            for k, seq in pairs(self.extra_key_events) do
-                if self:_isTextKeyWithoutModifier(seq) then
-                    self.key_events[k] = nil
-                end
             end
         end
     end
@@ -927,11 +923,6 @@ end
 
 function VirtualKeyboard:onClose()
     UIManager:close(self)
-    if self.inputbox and Device:hasDPad() then
-        -- let input text handle Back event to unfocus
-        -- otherwise, another extra Back event needed
-        return false
-    end
     return true
 end
 
@@ -952,19 +943,12 @@ end
 function VirtualKeyboard:onShow()
     self:_refresh(true)
     self.visible = true
-    Device:startTextInput()
     return true
 end
 
 function VirtualKeyboard:onCloseWidget()
     self:_refresh(true)
     self.visible = false
-    -- NOTE: This effectively stops SDL text input when a keyboard is hidden (... but navigational stuff still works).
-    --       If you instead wanted it to be enabled as long as an input dialog is displayed, regardless of VK's state,
-    --       this could be moved to InputDialog's onShow/onCloseWidget handlers (but, it would allow input on unfocused fields).
-    -- NOTE: But something more complex, possibly based on an in-class ref count would have to be implemented in order to be able to deal
-    --       with multiple InputDialogs being shown and closed in asymmetric fashion... Ugh.
-    Device:stopTextInput()
 end
 
 function VirtualKeyboard:lockVisibility(toggle)
@@ -1069,7 +1053,7 @@ function VirtualKeyboard:addKeys()
                 width = key_width,
                 height = key_height,
             }
-            if not virtual_key.key_chars then
+            if not virtual_key.key_chars and label ~= "" then
                 virtual_key.swipe_callback = nil
             end
             table.insert(horizontal_group, virtual_key)
@@ -1131,6 +1115,11 @@ function VirtualKeyboard:delChar()
     self.inputbox:delChar()
 end
 
+function VirtualKeyboard:delWord(left_to_cursor)
+    logger.dbg("delete word")
+    self.inputbox:delWord(left_to_cursor)
+end
+
 function VirtualKeyboard:delToStartOfLine()
     logger.dbg("delete to start of line")
     self.inputbox:delToStartOfLine()
@@ -1171,11 +1160,6 @@ end
 
 function VirtualKeyboard:scrollDown()
     self.inputbox:scrollDown()
-end
-
-function VirtualKeyboard:clear()
-    logger.dbg("clear input")
-    self.inputbox:clear()
 end
 
 return VirtualKeyboard

@@ -2,11 +2,11 @@ local Blitbuffer = require("ffi/blitbuffer")
 local Cache = require("cache")
 local Device = require("device")
 local Geom = require("ui/geometry")
+local InputContainer = require("ui/widget/container/inputcontainer")
 local Persist = require("persist")
 local RenderImage = require("ui/renderimage")
 local TileCacheItem = require("document/tilecacheitem")
 local UIManager = require("ui/uimanager")
-local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local Screen = Device.screen
 local ffiutil = require("ffi/util")
 local logger = require("logger")
@@ -18,13 +18,14 @@ local _ = require("gettext")
 -- It handles launching via the menu or Dispatcher/Gestures two fullscreen
 -- widgets related to showing pages and thumbnails that will make use of
 -- its services: BookMap and PageBrowser.
-local ReaderThumbnail = WidgetContainer:extend{}
+local ReaderThumbnail = InputContainer:extend{}
 
 function ReaderThumbnail:init()
-    if not Device:isTouchDevice() then
+    if not Device:isTouchDevice() and not Device:useDPadAsActionKeys() then
         -- The BookMap and PageBrowser widgets depend too much on gestures,
-        -- making them work with keys would be hard and very limited, so
+        -- making them work with not enough keys on Non-Touch would be hard and very limited, so
         -- just don't make them available.
+        -- We will only let them run on useDPadAsActionKeys devices.
         return
     end
 
@@ -62,6 +63,11 @@ function ReaderThumbnail:init()
     end
 end
 
+-- function ReaderThumbnail:registerKeyEvents()
+--     Now handled by hotkeys.koplugin:
+--     onShowBookMap = { { "Shift", "Down" } }
+-- end
+
 function ReaderThumbnail:addToMainMenu(menu_items)
     menu_items.book_map = {
         text = _("Book map"),
@@ -71,6 +77,7 @@ function ReaderThumbnail:addToMainMenu(menu_items)
         -- Show the alternative overview mode (which is just a restricted
         -- variation of the main book map) with long-press (let's avoid
         -- adding another item in the crowded first menu).
+        hold_keep_menu_open = false,
         hold_callback = function()
             self:onShowBookMap(true)
         end,
@@ -186,11 +193,11 @@ function ReaderThumbnail:removeFromCache(hash_subs, remove_only_non_matching)
     return nb_removed, size_removed
 end
 
-function ReaderThumbnail:resetCachedPagesForBookmarks(...)
+function ReaderThumbnail:resetCachedPagesForBookmarks(annotations)
     -- Multiple bookmarks may be provided
     local start_page, end_page
-    for i = 1, select("#", ...) do
-        local bm = select(i, ...)
+    for i = 1, #annotations do
+        local bm = annotations[i]
         if self.ui.rolling then
             -- Look at all properties that may be xpointers
             for _, k in ipairs({"page", "pos0", "pos1"}) do
@@ -500,7 +507,7 @@ function ReaderThumbnail:_getPageImage(page)
         self.ui.bookmark:onPageUpdate(page) -- Update dogear state for this page
     end
 
-    -- Draw the page on a new BB with the targetted size
+    -- Draw the page on a new BB with the targeted size
     local bb = Blitbuffer.new(target_w, target_h, self.bb_type)
     self.ui.view:paintTo(bb, 0, 0)
 
@@ -528,6 +535,10 @@ function ReaderThumbnail:onCloseDocument()
     end
 end
 
+function ReaderThumbnail:onRenderingModeUpdate()
+    self:resetCache()
+end
+
 function ReaderThumbnail:onColorRenderingUpdate()
     self:setupColor()
     self:resetCache()
@@ -537,9 +548,6 @@ end
 ReaderThumbnail.onDocumentRerendered = ReaderThumbnail.resetCache
 ReaderThumbnail.onDocumentPartiallyRerendered = ReaderThumbnail.resetCache
 -- Emitted When adding/removing/updating bookmarks and highlights
-ReaderThumbnail.onBookmarkAdded = ReaderThumbnail.resetCachedPagesForBookmarks
-ReaderThumbnail.onBookmarkRemoved = ReaderThumbnail.resetCachedPagesForBookmarks
-ReaderThumbnail.onBookmarkUpdated = ReaderThumbnail.resetCachedPagesForBookmarks
-ReaderThumbnail.onBookmarkEdited = ReaderThumbnail.resetCachedPagesForBookmarks
+ReaderThumbnail.onAnnotationsModified = ReaderThumbnail.resetCachedPagesForBookmarks
 
 return ReaderThumbnail

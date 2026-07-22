@@ -3,6 +3,7 @@ This module provides a way to display book information (filename and book metada
 ]]
 
 local BD = require("ui/bidi")
+local BookList = require("ui/widget/booklist")
 local ButtonDialog = require("ui/widget/buttondialog")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
@@ -12,16 +13,20 @@ local DocumentRegistry = require("document/documentregistry")
 local Event = require("ui/event")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
+local Math = require("optmath")
+local Notification = require("ui/widget/notification")
 local TextViewer = require("ui/widget/textviewer")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
-local Utf8Proc = require("ffi/utf8proc")
+local datetime = require("datetime")
+local ffiUtil = require("ffi/util")
 local filemanagerutil = require("apps/filemanager/filemanagerutil")
 local lfs = require("libs/libkoreader-lfs")
 local util = require("util")
 local _ = require("gettext")
 local N_ = _.ngettext
-local T = require("ffi/util").template
+local Screen = Device.screen
+local T = ffiUtil.template
 
 local BookInfo = WidgetContainer:extend{
     title = _("Book information"),
@@ -37,7 +42,7 @@ local BookInfo = WidgetContainer:extend{
     prop_text = {
         cover        = _("Cover image:"),
         title        = _("Title:"),
-        authors      = _("Authors:"),
+        authors      = _("Author(s):"),
         series       = _("Series:"),
         series_index = _("Series index:"),
         language     = _("Language:"),
@@ -63,56 +68,80 @@ function BookInfo:addToMainMenu(menu_items)
 end
 
 -- Shows book information.
-function BookInfo:show(file, book_props)
+function BookInfo:show(doc_settings_or_file, book_props)
     self.prop_updated = nil
+    self.summary_updated = nil
     local kv_pairs = {}
 
     -- File section
+    local has_sidecar = type(doc_settings_or_file) == "table"
+    local file = has_sidecar and doc_settings_or_file:readSetting("doc_path") or doc_settings_or_file
+    self.is_current_doc = self.document and self.document.file == file
+    if not has_sidecar and self.is_current_doc then
+        doc_settings_or_file = self.ui.doc_settings
+        has_sidecar = true
+    end
+    if not has_sidecar and BookList.hasBookBeenOpened(file) then
+        doc_settings_or_file = BookList.getDocSettings(file)
+        has_sidecar = true
+    end
     local folder, filename = util.splitFilePathName(file)
-    local __, filetype = filemanagerutil.splitFileNameType(filename)
     local attr = lfs.attributes(file)
-    local file_size = attr.size or 0
-    local size_f = util.getFriendlySize(file_size)
-    local size_b = util.getFormattedSize(file_size)
+    local is_file = attr and true or nil
     table.insert(kv_pairs, { _("Filename:"), BD.filename(filename) })
-    table.insert(kv_pairs, { _("Format:"), filetype:upper() })
-    table.insert(kv_pairs, { _("Size:"), string.format("%s (%s bytes)", size_f, size_b) })
-    table.insert(kv_pairs, { _("File date:"), os.date("%Y-%m-%d %H:%M:%S", attr.modification) })
-    table.insert(kv_pairs, { _("Folder:"), BD.dirpath(filemanagerutil.abbreviate(folder)), separator = true })
+    if is_file then
+        local __, filetype = filemanagerutil.splitFileNameType(filename)
+        local file_size = attr.size or 0
+        local size_f = util.getFriendlySize(file_size)
+        local size_b = util.getFormattedSize(file_size)
+        table.insert(kv_pairs, { _("Format:"), filetype:upper() })
+        table.insert(kv_pairs, { _("Size:"), string.format("%s (%s bytes)", size_f, size_b) })
+        table.insert(kv_pairs, { _("File date:"), os.date("%Y-%m-%d %H:%M:%S", attr.modification) })
+        table.insert(kv_pairs, { _("Folder:"), BD.dirpath(filemanagerutil.abbreviate(folder)), separator = true })
+    else -- for deleted books show doc_settings info only
+        table.insert(kv_pairs, { _("Metadata:"),
+            doc_settings_or_file:readSetting("metadata_arc").datetime, separator = true })
+    end
 
     -- Book section
     -- book_props may be provided if caller already has them available
     -- but it may lack "pages", that we may get from sidecar file
-    if not book_props or not book_props.pages then
-        book_props = BookInfo.getDocProps(file, book_props)
-    end
+    book_props = book_props or self:getDocProps(file, book_props)
+    book_props.pages = book_props.pages or BookList.getBookInfo(file).pages
     -- cover image
-    self.custom_book_cover = DocSettings:findCustomCoverFile(file)
-    local key_text = self.prop_text["cover"]
-    if self.custom_book_cover then
-        key_text = "\u{F040} " .. key_text
+    if is_file then
+        self.custom_book_cover = DocSettings:findCustomCoverFile(file)
+        local key_text = self.prop_text["cover"]
+        if self.custom_book_cover then
+            key_text = "\u{F040} " .. key_text
+        end
+        table.insert(kv_pairs, { key_text, _("Tap to display"),
+            callback = function()
+                self:onShowBookCover(file)
+            end,
+            hold_callback = function()
+                self:showCustomDialog(file, book_props)
+            end,
+            separator = true,
+        })
     end
-    table.insert(kv_pairs, { key_text, _("Tap to display"),
-        callback = function()
-            self:onShowBookCover(file)
-        end,
-        hold_callback = function()
-            self:showCustomDialog(file, book_props)
-        end,
-        separator = true,
-    })
     -- metadata
+    local n_a = _("N/A")
     local custom_props
-    local custom_metadata_file = DocSettings:findCustomMetadataFile(file)
-    if custom_metadata_file then
-        self.custom_doc_settings = DocSettings.openSettingsFile(custom_metadata_file)
-        custom_props = self.custom_doc_settings:readSetting("custom_props")
+    if is_file then
+        local custom_metadata_file = DocSettings:findCustomMetadataFile(file)
+        if custom_metadata_file then
+            self.custom_doc_settings = DocSettings.openSettingsFile(custom_metadata_file)
+            custom_props = self.custom_doc_settings:readSetting("custom_props")
+        end
+    else
+        custom_props = doc_settings_or_file:readSetting("metadata_arc").custom_props
     end
     local values_lang, callback
     for _i, prop_key in ipairs(self.props) do
         local prop = book_props[prop_key]
         if prop == nil or prop == "" then
-            prop = _("N/A")
+            prop = n_a
         elseif prop_key == "title" then
             prop = BD.auto(prop)
         elseif prop_key == "authors" or prop_key == "keywords" then
@@ -136,30 +165,110 @@ function BookInfo:show(file, book_props)
                 self:showBookProp("description", prop)
             end
         end
-        key_text = self.prop_text[prop_key]
+        local key_text = self.prop_text[prop_key]
         if custom_props and custom_props[prop_key] then -- customized
+            if not is_file then -- props not customized yet
+                prop = custom_props[prop_key]
+            end
             key_text = "\u{F040} " .. key_text
         end
         table.insert(kv_pairs, { key_text, prop,
             callback = callback,
-            hold_callback = function()
+            hold_callback = is_file and function()
                 self:showCustomDialog(file, book_props, prop_key)
             end,
         })
     end
     -- pages
-    local is_doc = self.document and true or false
-    table.insert(kv_pairs, { self.prop_text["pages"], book_props["pages"] or _("N/A"), separator = is_doc })
-
-    -- Page section
-    if is_doc then
-        local lines_nb, words_nb = self.ui.view:getCurrentPageLineWordCounts()
-        if lines_nb == 0 then
-            lines_nb = _("N/A")
-            words_nb = _("N/A")
+    local pages = book_props.pages or n_a
+    local pages_callback
+    if self.is_current_doc then
+        pages = doc_settings_or_file:readSetting("doc_pages")
+        local screen_pages = _("Screen pages") .. ":\n" .. pages
+        if self.document:hasHiddenFlows() then
+            screen_pages = screen_pages .. " " .. _("(including hidden flows)")
         end
-        table.insert(kv_pairs, { _("Current page lines:"), lines_nb })
-        table.insert(kv_pairs, { _("Current page words:"), words_nb })
+        local t_page, t_info = {}, {}
+        if self.ui.pagemap and self.ui.pagemap.has_pagemap then
+            if not self.ui.pagemap.use_page_labels then
+                table.insert(t_page, pages)
+                table.insert(t_info, screen_pages)
+            end
+            if self.ui.pagemap.chars_per_synthetic_page then
+                -- @translators characters per page
+                local txt = self.ui.pagemap:getLastPageLabel() .. " (" .. T(N_("1 char per page", "%1 chars per page",
+                    self.ui.pagemap.chars_per_synthetic_page), self.ui.pagemap.chars_per_synthetic_page) .. ")"
+                table.insert(t_page, txt)
+                table.insert(t_info, _("Synthetic pages") .. ":\n" .. txt)
+                if self.ui.pagemap.use_page_labels then
+                    table.insert(t_page, pages)
+                    table.insert(t_info, screen_pages)
+                end
+            end
+            if self.ui.pagemap.has_pagemap_document_provided then
+                if self.ui.pagemap.chars_per_synthetic_page then
+                    table.insert(t_page, "(℗)")
+                    table.insert(t_info, _("Publisher pages (℗):\navailable"))
+                else
+                    local count = select(3, self.ui.pagemap:getCurrentPageLabel())
+                    local first = self.ui.pagemap:getFirstPageLabel(true)
+                    local last = self.ui.pagemap:getLastPageLabel(true)
+                    local source = self.ui.document:getPageMapSource()
+                    if source == nil or source == "" then
+                        source = n_a
+                    end
+                    table.insert(t_page, count .. " (℗ " .. last .. ")")
+                    local t = _([[
+Publisher pages (℗):
+%1 (%2 - %3)
+Source (print edition):
+%4]])
+                    table.insert(t_info, T(t, count, first, last, source))
+                    if self.ui.pagemap.use_page_labels then
+                        table.insert(t_page, pages)
+                        table.insert(t_info, screen_pages)
+                    end
+                end
+            end
+        else
+            table.insert(t_page, pages)
+            table.insert(t_info, screen_pages)
+        end
+        pages = table.concat(t_page, " | ")
+        pages_callback = function()
+            UIManager:show(InfoMessage:new{
+                text = table.concat(t_info, "\n\n"),
+            })
+        end
+    end
+    table.insert(kv_pairs, { self.prop_text["pages"], pages, callback = pages_callback, separator = true })
+
+    -- Current page
+    if self.document then
+        local lines_nb, words_nb = self.ui.view:getCurrentPageLineWordCounts()
+        local text = lines_nb == 0 and _("number of lines and words not available")
+            or T(N_("1 line", "%1 lines", lines_nb), lines_nb) .. ", " .. T(N_("1 word", "%1 words", words_nb), words_nb)
+        table.insert(kv_pairs, { _("Current page:"), text, separator = true })
+    end
+
+    -- Summary section
+    local summary = has_sidecar and doc_settings_or_file:readSetting("summary") or {}
+    local summary_hold_callback = is_file and function()
+        self:editSummary(doc_settings_or_file, book_props)
+    end
+    table.insert(kv_pairs, { _("Rating:"), BookList.getBookRatingString(summary.rating or 0),
+        hold_callback = summary_hold_callback })
+    table.insert(kv_pairs, { _("Review:"), summary.note or n_a,
+        hold_callback = summary_hold_callback, separator = true })
+
+    -- Notebook file
+    if is_file then
+        local notebook_file = self:getNotebookFile(doc_settings_or_file)
+        local notebook_file_callback = function()
+            self:showNotebookFileDialog(notebook_file, doc_settings_or_file, book_props)
+        end
+        table.insert(kv_pairs, { _("Notebook file:"), notebook_file:gsub(".*/", ""),
+            callback = notebook_file_callback })
     end
 
     local KeyValuePage = require("ui/widget/keyvaluepage")
@@ -174,6 +283,9 @@ function BookInfo:show(file, book_props)
             if self.prop_updated then
                 UIManager:broadcastEvent(Event:new("InvalidateMetadataCache", file))
                 UIManager:broadcastEvent(Event:new("BookMetadataChanged", self.prop_updated))
+            end
+            if self.summary_updated then -- refresh file browser, sdr folder may appear
+                UIManager:broadcastEvent(Event:new("BookMetadataChanged"))
             end
         end,
     }
@@ -205,9 +317,17 @@ function BookInfo.extendProps(original_props, filepath)
 end
 
 -- Returns customized document metadata, including number of pages.
-function BookInfo.getDocProps(file, book_props, no_open_document)
-    if DocSettings:hasSidecarFile(file) then
-        local doc_settings = DocSettings:open(file)
+function BookInfo:getDocProps(file, book_props, no_open_document)
+    if self.ui.coverbrowser then
+        book_props = self.ui.coverbrowser.getDocProps(file)
+        if book_props ~= nil then -- already customized
+            book_props.display_title = book_props.title or filemanagerutil.splitFileNameType(file)
+            return book_props
+        end
+    end
+
+    if BookList.hasBookBeenOpened(file) then
+        local doc_settings = BookList.getDocSettings(file)
         if not book_props then
             -- Files opened after 20170701 have a "doc_props" setting with
             -- complete metadata and "doc_pages" with accurate nb of pages
@@ -242,7 +362,7 @@ function BookInfo.getDocProps(file, book_props, no_open_document)
 
     -- If still no book_props, open the document to get them
     if not book_props and not no_open_document then
-        local document = DocumentRegistry:openDocument(file)
+        local document = DocumentRegistry:hasProvider(file) and DocumentRegistry:openDocument(file)
         if document then
             local loaded = true
             local pages
@@ -281,10 +401,7 @@ function BookInfo:findInProps(book_props, search_string, case_sensitive)
             elseif key == "description" then
                 prop = util.htmlToPlainTextIfHtml(prop)
             end
-            if not case_sensitive then
-                prop = Utf8Proc.lowercase(util.fixUtf8(prop, "?"))
-            end
-            if prop:find(search_string) then
+            if util.stringSearch(prop, search_string, case_sensitive) ~= 0 then
                 return true
             end
         end
@@ -295,7 +412,7 @@ end
 function BookInfo:onShowBookInfo()
     if self.document then
         self.ui.doc_props.pages = self.ui.doc_settings:readSetting("doc_pages")
-        self:show(self.document.file, self.ui.doc_props)
+        self:show(self.ui.doc_settings, self.ui.doc_props)
     end
 end
 
@@ -310,7 +427,7 @@ end
 function BookInfo:onShowBookDescription(description, file)
     if not description then
         if file then
-            description = BookInfo.getDocProps(file).description
+            description = self:getDocProps(file).description
         elseif self.document then -- currently opened document
             description = self.ui.doc_props.description
         end
@@ -341,11 +458,12 @@ function BookInfo:onShowBookCover(file, force_orig)
     end
 end
 
-function BookInfo:getCoverImage(doc, file, force_orig)
+function BookInfo:getCoverImage(document, file, force_orig)
+    local curr_file = document and document.file
     local cover_bb
     -- check for a custom cover (orig cover is forcibly requested in "Book information" only)
     if not force_orig then
-        local custom_cover = DocSettings:findCustomCoverFile(file or (doc and doc.file))
+        local custom_cover = DocSettings:findCustomCoverFile(file or curr_file)
         if custom_cover then
             local cover_doc = DocumentRegistry:openDocument(custom_cover)
             if cover_doc then
@@ -356,16 +474,19 @@ function BookInfo:getCoverImage(doc, file, force_orig)
         end
     end
     -- orig cover
-    local is_doc = doc and true or false
-    if not is_doc then
+    local doc
+    local do_open = file ~= nil and file ~= curr_file
+    if do_open then
         doc = DocumentRegistry:openDocument(file)
         if doc and doc.loadDocument then -- CreDocument
             doc:loadDocument(false) -- load only metadata
         end
+    else
+        doc = document
     end
     if doc then
         cover_bb = doc:getCoverPageImage()
-        if not is_doc then
+        if do_open then
             doc:close()
         end
     end
@@ -454,7 +575,7 @@ function BookInfo:setCustomMetadata(file, book_props, prop_key, prop_value)
     if prop_key == "title" then -- generate when resetting the customized title and original is empty
         book_props.display_title = book_props.title or filemanagerutil.splitFileNameType(file)
     end
-    if self.document and self.document.file == file then -- currently opened document
+    if self.is_current_doc then
         self.ui.doc_props[prop_key] = prop_value
         if prop_key == "title" then
             self.ui.doc_props.display_title = book_props.display_title
@@ -587,6 +708,233 @@ function BookInfo:showCustomDialog(file, book_props, prop_key)
     UIManager:show(button_dialog)
 end
 
+function BookInfo:editSummary(doc_settings_or_file, book_props)
+    local has_sidecar = type(doc_settings_or_file) == "table"
+    local summary = has_sidecar and doc_settings_or_file:readSetting("summary") or {}
+    local rating = summary.rating or 0
+    local input_dialog
+    local rating_buttons_row = {}
+    local rating_max = 5
+    for i = -1, rating_max + 2 do -- 2 empty buttons on each side
+        if i < 1 or i > rating_max then
+            table.insert(rating_buttons_row, {
+                text = "",
+                no_vertical_sep = true,
+                enabled = false,
+            })
+        else
+            table.insert(rating_buttons_row, {
+                text = i <= rating and "★" or "☆",
+                no_vertical_sep = true,
+                callback = function()
+                    UIManager:close(input_dialog)
+                    local note = input_dialog:getInputText()
+                    summary.note = note ~= "" and note or nil
+                    summary.rating = (i ~= 1 or summary.rating ~= 1) and i or nil
+                    doc_settings_or_file = filemanagerutil.saveSummary(doc_settings_or_file, summary)
+                    BookList.setBookInfoCacheProperty(doc_settings_or_file:readSetting("doc_path"), "rating", summary.rating)
+                    self.summary_updated = true
+                    self.kvp_widget:onClose()
+                    self:show(doc_settings_or_file, book_props)
+                end,
+            })
+        end
+    end
+    input_dialog = InputDialog:new{
+        title = _("Edit book review"),
+        input = summary.note,
+        text_height = Screen:scaleBySize(160),
+        allow_newline = true,
+        buttons = {
+            rating_buttons_row,
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(input_dialog)
+                    end,
+                },
+                {
+                    text = _("Save review"),
+                    callback = function()
+                        UIManager:close(input_dialog)
+                        local note = input_dialog:getInputText()
+                        summary.note = note ~= "" and note or nil
+                        doc_settings_or_file = filemanagerutil.saveSummary(doc_settings_or_file, summary)
+                        BookList.setBookInfoCacheProperty(doc_settings_or_file:readSetting("doc_path"), "been_opened", true)
+                        self.summary_updated = true
+                        self.kvp_widget:onClose()
+                        self:show(doc_settings_or_file, book_props)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(input_dialog)
+    input_dialog:onShowKeyboard(true)
+end
+
+-- notebook file
+
+function BookInfo:getNotebookFile(doc_settings_or_file)
+    local notebook_file
+    if type(doc_settings_or_file) == "table" then
+        notebook_file = doc_settings_or_file:readSetting("notebook_file")
+    end
+    if notebook_file == nil then
+        notebook_file = G_reader_settings:readSetting("notebook_file")
+        if notebook_file == nil then
+            if type(doc_settings_or_file) == "table" then
+                notebook_file = doc_settings_or_file:readSetting("doc_path") .. ".txt"
+            elseif type(doc_settings_or_file) == "string" then
+                notebook_file = doc_settings_or_file .. ".txt"
+            else
+                local home_folder = filemanagerutil.getHomeFolder()
+                notebook_file = ffiUtil.realpath(home_folder) .. "/notebook.txt"
+            end
+        end
+    end
+    return notebook_file
+end
+
+function BookInfo:showNotebookFileDialog(notebook_file, doc_settings_or_file, book_props)
+    local has_sidecar = type(doc_settings_or_file) == "table"
+    local file = has_sidecar and doc_settings_or_file:readSetting("doc_path") or doc_settings_or_file
+    local function saveNotebookFile(new_notebook_file)
+        if not has_sidecar then
+            doc_settings_or_file = BookList.getDocSettings(doc_settings_or_file)
+        end
+        doc_settings_or_file:saveSetting("notebook_file", new_notebook_file)
+        if not self.is_current_doc then
+            if new_notebook_file or doc_settings_or_file:readSetting("summary") then
+                doc_settings_or_file:flush()
+            else -- remove empty sidecar
+                doc_settings_or_file:purge(nil, { doc_settings = true }) -- keep custom
+                doc_settings_or_file = file -- to reopen bookinfo
+            end
+            self.summary_updated = true -- refresh FM
+        end
+        self.kvp_widget:onClose()
+        self:show(doc_settings_or_file, book_props)
+    end
+
+    local button_dialog
+    local local_notebook_file = file .. ".txt"
+    local default_notebook_file = G_reader_settings:readSetting("notebook_file")
+    local buttons = {
+        {
+            {
+                text = _("Use default"),
+                enabled = default_notebook_file ~= nil and notebook_file ~= default_notebook_file,
+                callback = function()
+                    UIManager:close(button_dialog)
+                    saveNotebookFile(default_notebook_file)
+                end,
+            },
+            {
+                text = _("Reset default"),
+                enabled = default_notebook_file ~= nil,
+                callback = function()
+                    UIManager:close(button_dialog)
+                    G_reader_settings:delSetting("notebook_file")
+                    Notification:notify(_("Notebook file default location reset"), Notification.SOURCE_ALWAYS_SHOW)
+                end,
+            },
+        },
+        {
+            {
+                text = _("Use local"),
+                enabled = notebook_file ~= local_notebook_file,
+                callback = function()
+                    UIManager:close(button_dialog)
+                    saveNotebookFile(local_notebook_file)
+                end,
+            },
+            {
+                text = _("Set as default"),
+                enabled = notebook_file ~= default_notebook_file,
+                callback = function()
+                    UIManager:close(button_dialog)
+                    G_reader_settings:saveSetting("notebook_file", notebook_file)
+                    Notification:notify(_("Notebook file default location saved"), Notification.SOURCE_ALWAYS_SHOW)
+                end,
+            },
+        },
+        {
+            {
+                text = _("Choose"),
+                callback = function()
+                    UIManager:close(button_dialog)
+                    local PathChooser = require("ui/widget/pathchooser")
+                    local path_chooser = PathChooser:new{
+                        path = notebook_file:match("(.*)/"),
+                        select_directory = false,
+                        onConfirm = saveNotebookFile,
+                    }
+                    UIManager:show(path_chooser)
+                end,
+            },
+            {
+                text = _("Create"),
+                enabled = self.ui.texteditor ~= nil,
+                callback = function()
+                    UIManager:close(button_dialog)
+                    self.ui.texteditor:newFile(notebook_file, saveNotebookFile)
+                end,
+            },
+        },
+        {}, -- separator
+        {
+            {
+                text = _("View"),
+                enabled = lfs.attributes(notebook_file, "mode") == "file",
+                callback = function()
+                    UIManager:close(button_dialog)
+                    TextViewer.openFile(notebook_file)
+                end,
+            },
+            {
+                text = _("Edit"),
+                enabled = self.ui.texteditor ~= nil,
+                callback = function()
+                    UIManager:close(button_dialog)
+                    self.ui.texteditor:openFile(notebook_file, saveNotebookFile)
+                end,
+            },
+        },
+    }
+    button_dialog = ButtonDialog:new{
+        title = notebook_file,
+        title_align = "center",
+        buttons = buttons,
+    }
+    UIManager:show(button_dialog)
+end
+
+function BookInfo:onShowNotebookFile()
+    local notebook_file = self:getNotebookFile(self.ui.doc_settings)
+    if self.ui.texteditor then
+        local function saveNotebookFile(new_notebook_file)
+            if self.ui.doc_settings ~= nil then
+                self.ui.doc_settings:saveSetting("notebook_file", new_notebook_file)
+            end
+        end
+        self.ui.texteditor:openFile(notebook_file, saveNotebookFile)
+    elseif lfs.attributes(notebook_file, "mode") == "file" then
+        TextViewer.openFile(notebook_file)
+    end
+end
+
+-- book metadata (sdr)
+
+function BookInfo:onShowBookMetadataArchive()
+    if G_reader_settings:has("document_metadata_arc_folder") then
+        local BookMetadataArchive = require("ui/widget/bookmetadataarchive")
+        BookMetadataArchive:showBookList(self.ui)
+    end
+end
+
 function BookInfo:moveBookMetadata()
     -- called by filemanagermenu only
     local file_chooser = self.ui.file_chooser
@@ -678,6 +1026,167 @@ function BookInfo.showBooksWithHashBasedMetadata()
         title_multilines = true,
         text = table.concat(file_info, "\n"),
     })
+end
+
+function BookInfo:expandString(str, file, timestamp)
+    if self == nil then
+        UIManager:show(InfoMessage:new{
+            text = _([[
+%T title
+%A author
+%S series
+%t total pages
+%c current page
+%l pages left in chapter
+%p book percentage read
+%H time left in book
+%C chapter title
+%P chapter percentage read
+%h time left in chapter
+%F file path
+%f file name
+%b battery level
+%B battery symbol
+%r separator
+%D current date (yyyy-mm-dd)
+%d current date (mm-dd)
+%m current time (hh:mm)
+%M current time (hh-mm-ss)]]),
+            monospace_font = true,
+        })
+        return
+    end
+
+    if not (str and str:find("%%")) then
+        return str
+    end
+
+    local n_a = _("N/A")
+    local doc_patterns, is_doc_required = "%T%A%S%t%c%p%H%C%l%P%h"
+    local patterns = {}
+    for p in str:gmatch("%%%a") do
+        patterns[p] = n_a -- calculate only needed items
+        if not is_doc_required and doc_patterns:find(p, 1, true) then
+            is_doc_required = true
+        end
+    end
+
+    file = file or G_reader_settings:readSetting("lastfile")
+    if file then
+        if is_doc_required then
+            local props
+            local doc = self.document and self.document.file == file and self.document
+            if doc then -- Reader, currently opened file
+                props = self.ui.doc_props
+                local footer = self.ui.view.footer
+                local pageno = footer.pageno
+                if patterns["%t"] or patterns["%c"] then
+                    if self.ui.pagemap and self.ui.pagemap:wantsPageLabels() then
+                        patterns["%t"] = patterns["%t"] and self.ui.pagemap:getLastPageLabel(true)
+                        patterns["%c"] = patterns["%c"] and self.ui.pagemap:getCurrentPageLabel(true)
+                    elseif doc:hasHiddenFlows() then
+                        patterns["%t"] = patterns["%t"] and doc:getTotalPagesInFlow(doc:getPageFlow(pageno))
+                        patterns["%c"] = patterns["%c"] and doc:getPageNumberInFlow(pageno)
+                    else
+                        patterns["%t"] = patterns["%t"] and footer.pages
+                        patterns["%c"] = patterns["%c"] and pageno
+                    end
+                end
+                patterns["%p"] = patterns["%p"] and Math.round(footer.percent_finished * 100)
+                if patterns["%C"] then
+                    local title = self.ui.toc:getTocTitleByPage(pageno)
+                    if title and title ~= "" then
+                        patterns["%C"] = title
+                    end
+                end
+                if patterns["%l"] then
+                    local pages_left_in_chapter = self.ui.toc:getChapterPagesLeft(pageno) or doc:getTotalPagesLeft(pageno)
+                    if pages_left_in_chapter then
+                        if footer.settings.pages_left_includes_current_page then
+                             pages_left_in_chapter = pages_left_in_chapter + 1
+                        end
+                        patterns["%l"] = pages_left_in_chapter
+                    end
+                end
+                patterns["%P"] = patterns["%P"] and Math.round(footer:getChapterProgress(true) * 100)
+                if (patterns["%H"] or patterns["%h"]) and self.ui.statistics then
+                    local pages = doc:getTotalPagesLeft(pageno)
+                    if patterns["%H"] then
+                        local time_left = self.ui.statistics:getTimeForPages(pages)
+                        if time_left then
+                            patterns["%H"] = time_left
+                        end
+                    end
+                    if patterns["%h"] then
+                        pages = self.ui.toc:getChapterPagesLeft(pageno, true) or pages
+                        local time_left = self.ui.statistics:getTimeForPages(pages)
+                        if time_left then
+                            patterns["%h"] = time_left
+                        end
+                    end
+                end
+            elseif BookList.hasBookBeenOpened(file) then -- do not open book, use sdr only
+                local doc_settings = BookList.getDocSettings(file)
+                props = BookInfo.extendProps(doc_settings:readSetting("doc_props"), file)
+                if patterns["%t"] or patterns["%c"] or patterns["%p"] then
+                    local book_info = BookList.getBookInfo(file)
+                    local percent = book_info.percent_finished
+                    if patterns["%p"] and percent then
+                        patterns["%p"] = Math.round(percent * 100)
+                    end
+                    local current_page
+                    local pages = doc_settings:readSetting("pagemap_last_page_label")
+                    if pages then -- stable pages
+                        current_page = doc_settings:readSetting("pagemap_current_page_label")
+                    else
+                        pages = book_info.pages
+                        current_page = percent and pages and Math.round(percent * pages)
+                    end
+                    if patterns["%t"] and pages then
+                        patterns["%t"] = pages
+                    end
+                    if patterns["%c"] and current_page then
+                        patterns["%c"] = current_page
+                    end
+                end
+                -- %H %C %P %h unavailable
+            end
+            if props then
+                patterns["%T"] = patterns["%T"] and props.display_title
+                if patterns["%A"] and props.authors then
+                    patterns["%A"] = props.authors
+                end
+                if patterns["%S"] and props.series then
+                    patterns["%S"] = props.series_index and props.series .. " #" .. props.series_index or props.series
+                end
+            end
+        end
+
+        patterns["%F"] = patterns["%F"] and file
+        patterns["%f"] = patterns["%f"] and file:gsub(".*/", "")
+    end
+    if patterns["%r"] and self.document then
+        patterns["%r"] = self.ui.view.footer:genSeparator()
+    end
+    if (patterns["%b"] or patterns["%B"]) and Device:hasBattery() then
+        local powerd = Device:getPowerDevice()
+        local batt_lvl = powerd:getCapacity()
+        if Device:hasAuxBattery() and powerd:isAuxBatteryConnected() then
+            batt_lvl = batt_lvl + powerd:getAuxCapacity()
+            patterns["%B"] = patterns["%B"] and powerd:getBatterySymbol(powerd:isAuxCharged(), powerd:isAuxCharging(), batt_lvl / 2)
+        else
+            patterns["%B"] = patterns["%B"] and powerd:getBatterySymbol(powerd:isCharged(), powerd:isCharging(), batt_lvl)
+        end
+        patterns["%b"] = patterns["%b"] and batt_lvl
+    end
+
+    timestamp = timestamp or os.time()
+    patterns["%D"] = patterns["%D"] and os.date("%Y-%m-%d", timestamp)
+    patterns["%d"] = patterns["%d"] and os.date("%m-%d", timestamp)
+    patterns["%m"] = patterns["%m"] and datetime.secondsToHour(timestamp, G_reader_settings:isTrue("twelve_hour_clock"))
+    patterns["%M"] = patterns["%M"] and os.date("%H-%M-%S", timestamp)
+
+    return str:gsub("(%%%a)", patterns)
 end
 
 return BookInfo

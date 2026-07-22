@@ -3,6 +3,7 @@ local CheckMark = require("ui/widget/checkmark")
 local Device = require("device")
 local FFIUtil = require("ffi/util")
 local Font = require("ui/font")
+local InfoMessage = require("ui/widget/infomessage")
 local Language = require("ui/language")
 local Size = require("ui/size")
 local TextWidget = require("ui/widget/textwidget")
@@ -68,7 +69,6 @@ local function genKeyboardLayoutsSubmenu()
                     if #keyboard_layouts < 4 then
                         table.insert(keyboard_layouts, lang)
                     else -- no more space in the 'globe' popup
-                        local InfoMessage = require("ui/widget/infomessage")
                         UIManager:show(InfoMessage:new{
                             text = _("Up to four layouts can be enabled."),
                             timeout = 2,
@@ -161,17 +161,11 @@ local sub_item_table = {
         separator = true,
     },
     {
-        text = _("Swipe to input additional characters"),
-        checked_func = function()
-            return G_reader_settings:nilOrTrue("keyboard_swipes_enabled")
-        end,
-        callback = function()
-            G_reader_settings:flipNilOrTrue("keyboard_swipes_enabled")
-        end,
-    },
-    {
         text = _("Keyboard appearance settings"),
         keep_menu_open = true,
+        enabled_func = function()
+            return G_reader_settings:isTrue("virtual_keyboard_enabled") or (Device:isTouchDevice() and not Device:hasKeyboard())
+        end,
         callback = function(touchmenu_instance)
             local InputDialog = require("ui/widget/inputdialog")
             input_dialog = InputDialog:new{
@@ -233,5 +227,45 @@ local sub_item_table = {
         end,
     },
 }
+if Device:hasKeyboard() or Device:hasScreenKB() then
+    -- we use same pos. 4 as below so we are always above "keyboard appearance settings"
+    -- The shortcut that temporarily toggles the keyboard while a field is focused: a
+    -- lone Sym/ScreenKB press on devices that have such a key, otherwise Shift + Home.
+    local vk_shortcut
+    if Device:hasScreenKB() then
+        vk_shortcut = _("'ScreenKB'")
+    elseif Device:hasSymKey() then
+        vk_shortcut = _("'Sym'")
+    else
+        vk_shortcut = _("'Shift' + 'Home'")
+    end
+    table.insert(sub_item_table, 4, {
+        text = _("Show virtual keyboard"),
+        help_text = T(_("Enable this setting to always display the virtual keyboard within a text input field. When a field is selected (in focus), you can temporarily toggle the keyboard on/off by pressing %1."), vk_shortcut),
+        checked_func = function()
+            return G_reader_settings:isTrue("virtual_keyboard_enabled")
+        end,
+        callback = function()
+            G_reader_settings:flipNilOrFalse("virtual_keyboard_enabled")
+            if G_reader_settings:nilOrFalse("virtual_keyboard_enabled") then
+                UIManager:show(InfoMessage:new{
+                    text = T(_("When a text field is selected (in focus), you can temporarily bring up the virtual keyboard by pressing %1."), vk_shortcut),
+                })
+            end
+        end,
+    })
+end
+if Device:isTouchDevice() then
+    -- same pos. 4 as above so if both conditions are met we are above "Show virtual keyboard"
+    table.insert(sub_item_table, 4, {
+        text = _("Swipe to input additional characters"),
+        checked_func = function()
+            return G_reader_settings:nilOrTrue("keyboard_swipes_enabled")
+        end,
+        callback = function()
+            G_reader_settings:flipNilOrTrue("keyboard_swipes_enabled")
+        end,
+    })
+end
 
 return sub_item_table

@@ -1,16 +1,20 @@
 #!/bin/sh
+
 export LC_ALL="en_US.UTF-8"
 
 # Compute our working directory in an extremely defensive manner
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
 # NOTE: We need to remember the *actual* KOREADER_DIR, not the relocalized version in /tmp...
 export KOREADER_DIR="${KOREADER_DIR:-${SCRIPT_DIR}}"
+UNPACK_DIR="${KOREADER_DIR%/*}"
 
 # We rely on starting from our working directory, and it needs to be set, sane and absolute.
 cd "${KOREADER_DIR:-/dev/null}" || exit
 
-# To make USBMS behave, relocalize ourselves outside of onboard
-if [ "${SCRIPT_DIR}" != "/tmp" ]; then
+# To make USBMS behave, relocalize ourselves outside of onboard. Additionally,
+# this is used by KOReader to detect if the original script has changed after
+# an update (requiring a complete restart from the parent launcher).
+if [ "${SCRIPT_DIR}" != "/tmp" ] && [ "${SCRIPT_DIR}" != "/var/volatile/tmp" ]; then
     cp -pf "${0}" "/tmp/koreader.sh"
     chmod 777 "/tmp/koreader.sh"
     exec "/tmp/koreader.sh" "$@"
@@ -95,11 +99,13 @@ ko_update_check() {
         # Clear screen to delete UI leftovers
         ./fbink --cls
         ./fbink -q -y -7 -pmh "Updating KOReader"
+        # Keep a copy of the old manifest for cleaning leftovers later.
+        cp "${KOREADER_DIR}/ota/package.index" /tmp/
         # Setup the FBInk daemon
         export FBINK_NAMED_PIPE="/tmp/koreader.fbink"
         rm -f "${FBINK_NAMED_PIPE}"
         # We'll want to use REAGL on sunxi, because AUTO is slow, and fast merges are extremely broken outside of REAGL...
-        eval "$(fbink -e | tr ';' '\n' | grep -e isSunxi | tr '\n' ';')"
+        eval "$(./fbink -e | tr ';' '\n' | grep -e isSunxi | tr '\n' ';')"
         # shellcheck disable=SC2154
         if [ "${isSunxi}" = "1" ]; then
             PBAR_WFM="REAGL"
@@ -119,6 +125,8 @@ ko_update_check() {
         # Cleanup behind us...
         if [ "${fail}" -eq 0 ]; then
             mv "${NEWUPDATE}" "${INSTALLED}"
+            # Cleanup leftovers from previous install.
+            (cd "${UNPACK_DIR}" && grep -xvFf "${KOREADER_DIR}/ota/package.index" /tmp/package.index | xargs -r rm -vf)
             ./fbink -q -y -6 -pm "Update successful :)"
             ./fbink -q -y -5 -pm "KOReader will start momentarily . . ."
 
@@ -131,7 +139,7 @@ ko_update_check() {
             ./fbink -q -y -6 -pmh "Update failed :("
             ./fbink -q -y -5 -pm "KOReader may fail to function properly!"
         fi
-        rm -f "${NEWUPDATE}" # always purge newupdate to prevent update loops
+        rm -f /tmp/package.index "${NEWUPDATE}" # always purge newupdate to prevent update loops
         unset CPOINTS FBINK_NAMED_PIPE
         unset BLOCKS FILESIZE FBINK_PID
         # Ensure everything is flushed to disk before we restart. This *will* stall for a while on slow storage!
@@ -145,9 +153,6 @@ if [ -n "${fail}" ] && [ "${fail}" -eq 0 ]; then
     # By now, we know we're in the right directory, and our script name is pretty much set in stone, so we can forgo using $0
     exec ./koreader.sh "${@}"
 fi
-
-# export trained OCR data directory
-export TESSDATA_PREFIX="data"
 
 # export dict directory
 export STARDICT_DATA_DIR="data/dict"
@@ -212,7 +217,7 @@ if [ "${VIA_NICKEL}" = "true" ]; then
     #       as we want to be able to use our own per-if processes w/ custom args later on.
     #       A SIGTERM does not break anything, it'll just prevent automatic lease renewal until the time
     #       KOReader actually sets the if up itself (i.e., it'll do)...
-    killall -q -TERM nickel hindenburg sickel fickel strickel fontickel adobehost foxitpdf iink dhcpcd-dbus dhcpcd bluealsa bluetoothd fmon nanoclock.lua
+    killall -q -TERM nickel hindenburg sickel fickel strickel fontickel adobehost foxitpdf iink dhcpcd-dbus dhcpcd bluealsa bluetoothd fmon nanoclock.lua memorylogger QtWebEngineProcess
 
     # Wait for Nickel to die... (oh, procps with killall -w, how I miss you...)
     kill_timeout=0
@@ -241,6 +246,11 @@ fi
 
 if [ -z "${PRODUCT}" ]; then
     PRODUCT="$(/bin/kobo_config.sh 2>/dev/null)"
+    export PRODUCT
+fi
+
+if [ -z "${PRODUCT}" ]; then
+    PRODUCT="$(/usr/bin/hwdetect.sh 2>/dev/null)"
     export PRODUCT
 fi
 
@@ -330,6 +340,22 @@ ko_do_fbdepth() {
         ./fbdepth -R UR >>crash.log 2>&1
         # We haven't actually done anything, so don't do anything on exit either ;).
         unset ORIG_FB_BPP
+
+        return
+    fi
+
+    # On color panels, we target 32bpp for, well, color, and sane addressing (it also happens to be their default) ;o).
+    eval "$(./fbink -e | tr ';' '\n' | grep -e hasColorPanel | tr '\n' ';')"
+    # shellcheck disable=SC2154
+    if [ "${hasColorPanel}" = "1" ]; then
+        # If color rendering has been disabled by the user, switch to 8bpp to completely skip CFA processing
+        if grep -q '\["color_rendering"\] = false' 'settings.reader.lua' 2>/dev/null; then
+            echo "Switching fb bitdepth to 8bpp (to disable CFA) & rotation to Portrait" >>crash.log 2>&1
+            ./fbdepth -d 8 -R UR >>crash.log 2>&1
+        else
+            echo "Switching fb bitdepth to 32bpp & rotation to Portrait" >>crash.log 2>&1
+            ./fbdepth -d 32 -R UR >>crash.log 2>&1
+        fi
 
         return
     fi
@@ -573,25 +599,25 @@ while [ ${RETURN_VALUE} -ne 0 ]; do
     fi
 done
 
-# Restore original fb bitdepth if need be...
-# Since we also (almost) always enforce Portrait, we also have to restore the original rotation no matter what ;).
-if [ -n "${ORIG_FB_BPP}" ]; then
-    echo "Restoring original fb bitdepth @ ${ORIG_FB_BPP}bpp & rotation @ ${ORIG_FB_ROTA}" >>crash.log 2>&1
-    ./fbdepth -d "${ORIG_FB_BPP}" -r "${ORIG_FB_ROTA}" >>crash.log 2>&1
-else
-    echo "Restoring original fb rotation @ ${ORIG_FB_ROTA}" >>crash.log 2>&1
-    ./fbdepth -r "${ORIG_FB_ROTA}" >>crash.log 2>&1
-fi
-
-# Restore original CPUFreq governor if need be...
-if [ -n "${ORIG_CPUFREQ_GOV}" ]; then
-    echo "${ORIG_CPUFREQ_GOV}" >"${CPUFREQ_SYSFS_PATH}/scaling_governor"
-
-    # NOTE: Leave DVFS alone, it'll be handled by Nickel if necessary.
-fi
-
 # If we requested a reboot/shutdown, no need to bother with this...
 if [ ${RETURN_VALUE} -ne ${KO_RC_HALT} ]; then
+    # Restore original fb bitdepth if need be...
+    # Since we also (almost) always enforce Portrait, we also have to restore the original rotation no matter what ;).
+    if [ -n "${ORIG_FB_BPP}" ]; then
+        echo "Restoring original fb bitdepth @ ${ORIG_FB_BPP}bpp & rotation @ ${ORIG_FB_ROTA}" >>crash.log 2>&1
+        ./fbdepth -d "${ORIG_FB_BPP}" -r "${ORIG_FB_ROTA}" >>crash.log 2>&1
+    else
+        echo "Restoring original fb rotation @ ${ORIG_FB_ROTA}" >>crash.log 2>&1
+        ./fbdepth -r "${ORIG_FB_ROTA}" >>crash.log 2>&1
+    fi
+
+    # Restore original CPUFreq governor if need be...
+    if [ -n "${ORIG_CPUFREQ_GOV}" ]; then
+        echo "${ORIG_CPUFREQ_GOV}" >"${CPUFREQ_SYSFS_PATH}/scaling_governor"
+
+        # NOTE: Leave DVFS alone, it'll be handled by Nickel if necessary.
+    fi
+
     if [ "${VIA_NICKEL}" = "true" ]; then
         if [ "${FROM_KFMON}" = "true" ]; then
             # KFMon is the only launcher that has a toggle to either reboot or restart Nickel on exit

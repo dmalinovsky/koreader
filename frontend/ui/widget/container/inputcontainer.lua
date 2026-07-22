@@ -46,6 +46,7 @@ local Screen = Device.screen
 local _ = require("gettext")
 
 local InputContainer = WidgetContainer:extend{
+    align = "left",
     vertical_align = "top",
 }
 
@@ -80,12 +81,14 @@ function InputContainer:paintTo(bb, x, y)
         self.dimen.x = x
         self.dimen.y = y
     end
-    if self.vertical_align == "center" then
-        local content_size = self[1]:getSize()
-        self[1]:paintTo(bb, x, y + math.floor((self.dimen.h - content_size.h)/2))
-    else
-        self[1]:paintTo(bb, x, y)
+    local content_size = self[1]:getSize()
+    if self.align == "center" then
+        x = x + math.floor((self.dimen.w - content_size.w)/2)
     end
+    if self.vertical_align == "center" then
+        y = y + math.floor((self.dimen.h - content_size.h)/2)
+    end
+    self[1]:paintTo(bb, x, y)
 end
 
 --[[--
@@ -362,10 +365,10 @@ end
 function InputContainer:onInput(input, ignore_first_hold_release)
     local InputDialog = require("ui/widget/inputdialog")
     self.input_dialog = InputDialog:new{
-        title = input.title or "",
+        title = input.title,
         input = input.input_func and input.input_func() or input.input,
-        input_hint = input.hint_func and input.hint_func() or input.hint or "",
-        input_type = input.type or "number",
+        input_hint = input.hint_func and input.hint_func() or input.hint,
+        input_type = input.input_type,
         buttons = input.buttons or {
             {
                 {
@@ -379,9 +382,10 @@ function InputContainer:onInput(input, ignore_first_hold_release)
                     text = input.ok_text or _("OK"),
                     is_enter_default = true,
                     callback = function()
-                        if input.deny_blank_input and self.input_dialog:getInputText() == "" then return end
-                        input.callback(self.input_dialog:getInputText())
-                        self:closeInputDialog()
+                        if input.allow_blank_input or self.input_dialog:getInputText() ~= "" then
+                            input.callback(self.input_dialog:getInputText())
+                            self:closeInputDialog()
+                        end
                     end,
                 },
             },

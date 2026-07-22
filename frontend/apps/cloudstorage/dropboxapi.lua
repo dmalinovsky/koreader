@@ -1,5 +1,6 @@
 local DocumentRegistry = require("document/documentregistry")
 local JSON = require("json")
+local ffiUtil = require("ffi/util")
 local http = require("socket.http")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
@@ -7,7 +8,6 @@ local ltn12 = require("ltn12")
 local socket = require("socket")
 local socketutil = require("socketutil")
 local util = require("util")
-local BaseUtil = require("ffi/util")
 local _ = require("gettext")
 
 local DropBoxApi = {
@@ -106,9 +106,13 @@ function DropBoxApi:fetchListFolders(path, token)
     logger.warn("DropBoxApi: error:", result_response)
 end
 
-function DropBoxApi:downloadFile(path, token, local_path)
+function DropBoxApi:downloadFile(path, token, local_path, progress_callback)
     local data1 = "{\"path\": \"" .. path .. "\"}"
     socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+
+    local handle = ltn12.sink.file(io.open(local_path, "w"))
+    handle = socketutil.chainSinkWithProgressCallback(handle, progress_callback)
+
     local code, headers, status = socket.skip(1, http.request{
         url     = API_DOWNLOAD_FILE,
         method  = "GET",
@@ -116,7 +120,7 @@ function DropBoxApi:downloadFile(path, token, local_path)
             ["Authorization"]   = "Bearer ".. token,
             ["Dropbox-API-Arg"] = data1,
         },
-        sink    = ltn12.sink.file(io.open(local_path, "w")),
+        sink    = handle,
     })
     socketutil:reset_timeout()
     if code ~= 200 then
@@ -126,7 +130,7 @@ function DropBoxApi:downloadFile(path, token, local_path)
 end
 
 function DropBoxApi:uploadFile(path, token, file_path, etag, overwrite)
-    local data = "{\"path\": \"" .. path .. "/" .. BaseUtil.basename(file_path) ..
+    local data = "{\"path\": \"" .. path .. "/" .. ffiUtil.basename(file_path) ..
         "\",\"mode\":" .. (overwrite and "\"overwrite\"" or "\"add\"") ..
         ",\"autorename\": " .. (overwrite and "false" or "true") ..
         ",\"mute\": false,\"strict_conflict\": false}"
@@ -195,6 +199,7 @@ function DropBoxApi:listFolder(path, token, folder_mode)
             table.insert(dropbox_file, {
                 text = text,
                 mandatory = util.getFriendlySize(files.size),
+                filesize = files.size,
                 url = files.path_display,
                 type = tag,
             })
@@ -202,10 +207,10 @@ function DropBoxApi:listFolder(path, token, folder_mode)
     end
     --sort
     table.sort(dropbox_list, function(v1,v2)
-        return v1.text < v2.text
+        return ffiUtil.strcoll(v1.text, v2.text)
     end)
     table.sort(dropbox_file, function(v1,v2)
-        return v1.text < v2.text
+        return ffiUtil.strcoll(v1.text, v2.text)
     end)
     -- Add special folder.
     if folder_mode then
@@ -221,6 +226,7 @@ function DropBoxApi:listFolder(path, token, folder_mode)
             mandatory = files.mandatory,
             url = files.url,
             type = files.type,
+            filesize = files.filesize,
         })
     end
     return dropbox_list

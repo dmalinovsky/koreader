@@ -1,4 +1,5 @@
 local Blitbuffer = require("ffi/blitbuffer")
+local BookList = require("ui/widget/booklist")
 local Button = require("ui/widget/button")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
@@ -11,7 +12,6 @@ local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local ImageWidget = require("ui/widget/imagewidget")
 local InputDialog = require("ui/widget/inputdialog")
-local InputText = require("ui/widget/inputtext")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local ProgressWidget = require("ui/widget/progresswidget")
@@ -30,7 +30,7 @@ local _ = require("gettext")
 local Screen = Device.screen
 local T = require("ffi/util").template
 
-local stats_book = {}
+local stats_book
 
 --[[
 -- Stored in the sidecar metadata, in a dedicated table:
@@ -42,59 +42,29 @@ local stats_book = {}
 },]]
 local BookStatusWidget = FocusManager:extend{
     padding = Size.padding.fullscreen,
-    settings = nil,
-    thumbnail = nil,
-    props = nil,
     star = nil, -- Button
     summary = nil, -- hash
+    note_frame = nil, -- FrameContainer wrapping the review text
+    note_widget = nil, -- TextBoxWidget showing the review text
 }
 
 function BookStatusWidget:init()
-    self.updated = false
+    self.updated = nil
     self.layout = {}
-    -- What a blank, full summary table should look like
-    local new_summary = {
-        rating = nil,
-        note = nil,
-        status = "",
-        modified = "",
-    }
-    if self.settings then
-        local summary = self.settings:readSetting("summary")
-        -- Check if the summary table we get is a full one, or a minimal one from CoverMenu...
-        if summary then
-            if summary.modified then
-                -- Complete, use it as-is
-                self.summary = summary
-            else
-                -- Incomplete, fill it up
-                self.summary = new_summary
-                util.tableMerge(self.summary, summary)
-            end
-        else
-            self.summary = new_summary
-        end
-    else
-        self.summary = new_summary
-    end
+    self.summary = self.ui.doc_settings:readSetting("summary")
     self.total_pages = self.ui.document:getPageCount()
-    stats_book = self:getStats()
+    stats_book = self.ui.statistics and self.ui.statistics:getStatsBookStatus() or {}
 
     self.small_font_face = Font:getFace("smallffont")
     self.medium_font_face = Font:getFace("ffont")
     self.large_font_face = Font:getFace("largeffont")
-
-    local button_enabled = true
-    if self.readonly then
-        button_enabled = false
-    end
 
     self.star = Button:new{
         icon = "star.empty",
         bordersize = 0,
         radius = 0,
         margin = 0,
-        enabled = button_enabled,
+        enabled = not self.readonly,
         show_parent = self,
         readonly = self.readonly,
     }
@@ -129,10 +99,6 @@ function BookStatusWidget:init()
     }
 
     self.dithered = true
-end
-
-function BookStatusWidget:getStats()
-    return {}
 end
 
 function BookStatusWidget:getStatDays()
@@ -228,6 +194,7 @@ function BookStatusWidget:genHeader(title)
 end
 
 function BookStatusWidget:onChangeBookStatus(option_name, option_value)
+    BookList.setBookInfoCacheProperty(self.ui.document.file, "status", option_name[option_value])
     self.summary.status = option_name[option_value]
     self.summary.modified = os.date("%Y-%m-%d", os.time())
     self.updated = true
@@ -250,7 +217,9 @@ function BookStatusWidget:setStar(num)
     local stars_group = HorizontalGroup:new{ align = "center" }
     local row = {}
     if num then
-        self.summary.rating = num
+        num = (num == 1 and self.summary.rating == 1) and 0 or num
+        self.summary.rating = num ~= 0 and num or nil
+        BookList.setBookInfoCacheProperty(self.ui.document.file, "rating", num)
         self.updated = true
 
         for i = 1, num do
@@ -299,13 +268,14 @@ function BookStatusWidget:genBookInfoGroup()
 
     -- Get a chance to have title and authors rendered with alternate
     -- glyphs for the book language
-    local lang = self.props.language
+    local props = self.ui.doc_props
+    local lang = props.language
     -- title
     local book_meta_info_group = VerticalGroup:new{
         align = "center",
         VerticalSpan:new{ width = height * 0.2 },
         TextBoxWidget:new{
-            text = self.props.display_title,
+            text = props.display_title,
             lang = lang,
             width = width,
             face = self.medium_font_face,
@@ -315,7 +285,7 @@ function BookStatusWidget:genBookInfoGroup()
     }
     -- author
     local text_author = TextBoxWidget:new{
-        text = self.props.authors,
+        text = props.authors,
         lang = lang,
         face = self.small_font_face,
         width = width,
@@ -344,8 +314,7 @@ function BookStatusWidget:genBookInfoGroup()
     )
     -- complete text
     local text_complete = TextWidget:new{
-        text = T(_("%1% Completed"),
-                        string.format("%1.f", read_percentage * 100)),
+        text = T(_("%1\xE2\x80\xAF% Completed"), string.format("%1.f", read_percentage * 100)),
         face = self.small_font_face,
     }
     table.insert(book_meta_info_group,
@@ -367,23 +336,21 @@ function BookStatusWidget:genBookInfoGroup()
         HorizontalSpan:new{ width =  split_span_width }
     }
     -- thumbnail
-    if self.thumbnail then
+    local thumbnail = self.ui.bookinfo:getCoverImage(self.ui.document)
+    if thumbnail then
         -- Much like BookInfoManager, honor AR here
-        local cbb_w, cbb_h = self.thumbnail:getWidth(), self.thumbnail:getHeight()
+        local cbb_w, cbb_h = thumbnail:getWidth(), thumbnail:getHeight()
         if cbb_w > img_width or cbb_h > img_height then
             local scale_factor = math.min(img_width / cbb_w, img_height / cbb_h)
             cbb_w = math.min(math.floor(cbb_w * scale_factor)+1, img_width)
             cbb_h = math.min(math.floor(cbb_h * scale_factor)+1, img_height)
-            self.thumbnail = RenderImage:scaleBlitBuffer(self.thumbnail, cbb_w, cbb_h, true)
+            thumbnail = RenderImage:scaleBlitBuffer(thumbnail, cbb_w, cbb_h, true)
         end
-
         table.insert(book_info_group, ImageWidget:new{
-            image = self.thumbnail,
+            image = thumbnail,
             width = cbb_w,
             height = cbb_h,
         })
-        -- dereference thumbnail since we let imagewidget manages its lifecycle
-        self.thumbnail = nil
     end
 
     table.insert(book_info_group, CenterContainer:new{
@@ -473,27 +440,47 @@ function BookStatusWidget:genSummaryGroup(width)
         height = Screen:scaleBySize(160)
     end
 
-    local text_padding = Size.padding.default
-    self.input_note = InputText:new{
-        text = self.summary.note,
-        face = self.medium_font_face,
-        width = width - self.padding * 3,
-        height = math.floor(height * 0.75),
-        scroll = true,
-        bordersize = Size.border.default,
-        focused = false,
-        padding = text_padding,
-        parent = self,
+    self.note_widget = TextBoxWidget:new{
+        text     = (self.summary.note and #self.summary.note > 0)
+                    and self.summary.note
+                    or (not self.readonly and _("A few words about the book") or ""),
+        face     = self.medium_font_face,
+        width    = width - self.padding * 3,
+        height   = math.floor(height * 0.75),
+        scroll   = true,
         readonly = self.readonly,
-        hint = _("A few words about the book"),
+        parent   = self,
     }
-    table.insert(self.layout, {self.input_note})
+
+    self.note_frame = FrameContainer:new{
+        bordersize = Size.border.thin,
+        padding = Size.padding.large,
+        focusable = true,
+        focus_border_size = Size.border.thick,
+        focus_inner_border = true,
+        enabled   = not self.readonly,
+        parent    = self,
+        self.note_widget,
+    }
+    self.note_frame.onGesture = function(frame, ev)
+        if ev and ev.ges == "tap"
+            and ev.pos
+            and self.note_frame
+            and self.note_frame.dimen
+            and ev.pos:intersectWith(self.note_frame.dimen)
+        then
+            return self:openReviewDialog()
+        end
+        return false
+    end
+
+    table.insert(self.layout, {self.note_frame})
 
     return VerticalGroup:new{
         VerticalSpan:new{ width = Size.span.vertical_large },
         CenterContainer:new{
             dimen = Geom:new{ w = width, h = height },
-            self.input_note
+            self.note_frame
         }
     }
 end
@@ -508,28 +495,16 @@ function BookStatusWidget:generateSwitchGroup(width)
         height = Screen:scaleBySize(105)
     end
 
-    local args = { "reading", "abandoned", "complete", }
-
-    local position = 1
-    for k, v in ipairs(args) do
-        if v == self.summary.status then
-            position = k
-            break
-        end
-    end
-
     local switch = ToggleSwitch:new{
         width = math.floor(width * 0.6),
-        name = "book_status",
-        event = "ChangeBookStatus",
         toggle = { _("Reading"), _("On hold"), _("Finished"), },
-        args = args,
-        alternate = false,
+        args = { "reading", "abandoned", "complete", },
         values = { 1, 2, 3, },
         enabled = not self.readonly,
         config = self,
         readonly = self.readonly,
     }
+    local position = util.arrayContains(switch.args, self.summary.status) or 1
     switch:setPosition(position)
     self:mergeLayoutInVertical(switch)
 
@@ -545,9 +520,7 @@ end
 
 function BookStatusWidget:onConfigChoose(values, name, event, args, position)
     UIManager:tickAfterNext(function()
-        if values then
-            self:onChangeBookStatus(args, position)
-        end
+        self:onChangeBookStatus(args, position)
         UIManager:setDirty(nil, "ui", nil, true)
     end)
 end
@@ -577,21 +550,21 @@ function BookStatusWidget:onMultiSwipe(arg, ges_ev)
 end
 
 function BookStatusWidget:onClose()
-    if self.updated and self.summary then
-        self.settings:saveSetting("summary", self.summary)
-        self.settings:flush()
+    if self.updated then
+        self.ui.doc_settings:flush()
     end
     -- NOTE: Flash on close to avoid ghosting, since we show an image.
     UIManager:close(self, "flashpartial")
+    if self.close_callback then
+        self.close_callback()
+    end
     return true
 end
 
-function BookStatusWidget:onSwitchFocus(inputbox)
+function BookStatusWidget:openReviewDialog()
     self.note_dialog = InputDialog:new{
         title = _("Review"),
-        input = self.input_note:getText(),
-        input_hint = "",
-        input_type = "text",
+        input = self.summary.note or "",
         scroll = true,
         allow_newline = true,
         text_height = Screen:scaleBySize(150),
@@ -609,8 +582,11 @@ function BookStatusWidget:onSwitchFocus(inputbox)
                     is_enter_default = true,
                     callback = function()
                         local note = self.note_dialog:getInputText()
-                        self.input_note:setText(note)
+                        note = note ~= "" and note or nil
                         self.summary.note = note
+                        if self.note_widget then
+                            self.note_widget:setText(note or _("A few words about the book"))
+                        end
                         self.updated = true
                         self:closeInputDialog()
                     end,
@@ -620,11 +596,13 @@ function BookStatusWidget:onSwitchFocus(inputbox)
     }
     UIManager:show(self.note_dialog)
     self.note_dialog:onShowKeyboard()
+    return true
 end
 
 function BookStatusWidget:closeInputDialog()
     UIManager:close(self.note_dialog)
-    self.input_note:onUnfocus()
+    self.note_dialog = nil
+    return true
 end
 
 return BookStatusWidget

@@ -5,6 +5,7 @@ local Notification = require("ui/widget/notification")
 local Screen = Device.screen
 local UIManager = require("ui/uimanager")
 local bit = require("bit")
+local logger = require("logger")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
@@ -16,6 +17,9 @@ function DeviceListener:onToggleNightMode()
     -- Make sure CRe will bypass the call cache
     if self.ui and self.ui.document and self.ui.document.provider == "crengine" then
         self.ui.document:resetCallCache()
+        if self.ui.highlight then
+            self.ui.highlight:setSelectionColor()
+        end
     end
     UIManager:setDirty("all", "full")
     UIManager:ToggleNightMode(not night_mode)
@@ -116,6 +120,7 @@ if Device:hasFrontlight() then
         else
             powerd:setIntensity(new_intensity)
         end
+        powerd:updateResumeFrontlightState()
         return true
     end
 
@@ -141,7 +146,7 @@ if Device:hasFrontlight() then
         -- do the computations in the native scale, to ensure we always actually *change* something,
         -- in case both the old and new value would round to the same native step,
         -- despite being different in the API scale, which is stupidly fixed at [0, 100]...
-        local warmth = powerd:fromNativeWarmth(powerd:toNativeWarmth(powerd:frontlightWarmth()) + delta)
+        local warmth = powerd:toNativeWarmth(powerd:frontlightWarmth()) + delta
 
         self:onSetFlWarmth(warmth)
         self:onShowWarmth()
@@ -155,7 +160,7 @@ if Device:hasFrontlight() then
         elseif warmth < 0 then
             warmth = 0
         end
-        powerd:setWarmth(warmth)
+        powerd:setWarmth(powerd:fromNativeWarmth(warmth))
         return true
     end
 
@@ -183,6 +188,7 @@ if Device:hasFrontlight() then
         if not powerd:toggleFrontlight(notif_cb) then
             Notification:notify(_("Frontlight unchanged."), notif_source)
         end
+        powerd:updateResumeFrontlightState()
     end
 
     function DeviceListener:onShowFlDialog()
@@ -203,6 +209,46 @@ if Device:hasGSensor() then
         end
         Notification:notify(new_text)
         return true
+    end
+
+    function DeviceListener:onTempGSensorOn()
+        local new_text
+        if G_reader_settings:nilOrFalse("input_ignore_gsensor") then
+            new_text = _("Accelerometer rotation events already on.")
+        else
+            Device:toggleGSensor(true)
+            new_text = _("Accelerometer rotation events on for 5 seconds.")
+            UIManager:scheduleIn(5.0, function()
+                Device:toggleGSensor(false)
+            end)
+        end
+        Notification:notify(new_text)
+        return true
+    end
+
+    function DeviceListener:onLockGSensor()
+        G_reader_settings:flipNilOrFalse("input_lock_gsensor")
+        self:setLockGsensor(G_reader_settings:isTrue("input_lock_gsensor"))
+        return true
+    end
+
+    -- @param flag bool on/off
+    function DeviceListener:onSetLockGSensor(flag)
+        self:setLockGsensor(flag)
+        return true
+    end
+
+    -- @param flag bool on/off
+    function DeviceListener:setLockGsensor(flag)
+        G_reader_settings:saveSetting("input_lock_gsensor", flag)
+        Device:lockGSensor(flag)
+        local new_text
+        if G_reader_settings:isTrue("input_lock_gsensor") then
+            new_text = _("Orientation locked.")
+        else
+            new_text = _("Orientation unlocked.")
+        end
+        Notification:notify(new_text)
     end
 end
 
@@ -295,9 +341,87 @@ function DeviceListener:onToggleFlashOnPagesWithImages()
     G_reader_settings:flipNilOrTrue("refresh_on_pages_with_images")
 end
 
-function DeviceListener:onSwapPageTurnButtons()
-    G_reader_settings:flipNilOrFalse("input_invert_page_turn_keys")
+function DeviceListener:onSwapPageTurnButtons(side)
+    local new_text
+    if side == "left" then
+        -- Revert any prior global inversions first, as we could end up with an all greyed out menu.
+        if G_reader_settings:isTrue("input_invert_page_turn_keys") then
+            self:setPageTurnButtonDirection(true)
+        end
+        G_reader_settings:flipNilOrFalse("input_invert_left_page_turn_keys")
+        Device:invertButtonsLeft()
+        if G_reader_settings:isTrue("input_invert_left_page_turn_keys") then
+            new_text = _("Left-side page-turn buttons inverted.")
+        else
+            new_text = _("Left-side page-turn buttons no longer inverted.")
+        end
+    elseif side == "right" then
+        -- Revert any prior global inversions first, as we could end up with an all greyed out menu.
+        if G_reader_settings:isTrue("input_invert_page_turn_keys") then
+            self:setPageTurnButtonDirection(true)
+        end
+        G_reader_settings:flipNilOrFalse("input_invert_right_page_turn_keys")
+        Device:invertButtonsRight()
+        if G_reader_settings:isTrue("input_invert_right_page_turn_keys") then
+            new_text = _("Right-side page-turn buttons inverted.")
+        else
+            new_text = _("Right-side page-turn buttons no longer inverted.")
+        end
+    else
+        -- Revert any prior inversions first, as we could end up with an all greyed out menu.
+        if G_reader_settings:isTrue("input_invert_left_page_turn_keys") and G_reader_settings:isTrue("input_invert_right_page_turn_keys") then
+            G_reader_settings:makeFalse("input_invert_left_page_turn_keys")
+            G_reader_settings:makeFalse("input_invert_right_page_turn_keys")
+            self:setPageTurnButtonDirection(true)
+            new_text = _("Page-turn buttons no longer inverted.")
+            Notification:notify(new_text)
+            return true
+        elseif G_reader_settings:isTrue("input_invert_left_page_turn_keys") then
+            G_reader_settings:makeFalse("input_invert_left_page_turn_keys")
+            Device:invertButtonsLeft()
+        elseif G_reader_settings:isTrue("input_invert_right_page_turn_keys") then
+            G_reader_settings:makeFalse("input_invert_right_page_turn_keys")
+            Device:invertButtonsRight()
+        end
+        G_reader_settings:flipNilOrFalse("input_invert_page_turn_keys")
+        Device:invertButtons()
+        if G_reader_settings:isTrue("input_invert_page_turn_keys") then
+            new_text = _("Page-turn buttons inverted.")
+        else
+            new_text = _("Page-turn buttons no longer inverted.")
+        end
+    end
+    Notification:notify(new_text)
+    return true
+end
+
+-- @param invert bool if the page turn buttons should be set to inverted or not
+function DeviceListener:setPageTurnButtonDirection(invert)
+    local setting = G_reader_settings:readSetting("input_invert_page_turn_keys")
+    if invert == setting then
+        return
+    end
+    G_reader_settings:saveSetting("input_invert_page_turn_keys", invert)
     Device:invertButtons()
+end
+
+-- @param invert bool if the page turn buttons should be set to inverted or not
+function DeviceListener:onSetPageTurnButtonDirection(invert)
+    local setting = G_reader_settings:readSetting("input_invert_page_turn_keys")
+    logger.dbg("DeviceListener:onSetPageTurnButtonDirection", invert, setting)
+    if invert == setting then
+        logger.dbg("DeviceListener:onSetPageTurnButtonDirection", "not toggling page turn buttons")
+        return
+    end
+    logger.dbg("DeviceListener:onSetPageTurnButtonDirection", "toggling page turn buttons")
+    self:setPageTurnButtonDirection(invert)
+    local text
+    if invert then
+        text = _("Page-turn buttons inverted.")
+    else
+        text = _("Page-turn buttons no longer inverted.")
+    end
+    Notification:notify(text)
 end
 
 function DeviceListener:onToggleKeyRepeat(toggle)
@@ -319,6 +443,10 @@ function DeviceListener:onRequestUSBMS()
     MassStorage:start(false)
 end
 
+function DeviceListener:onExit(callback)
+    self.ui.menu:exitOrRestart(callback)
+end
+
 function DeviceListener:onRestart()
     self.ui.menu:exitOrRestart(function() UIManager:restartKOReader() end)
 end
@@ -333,10 +461,6 @@ end
 
 function DeviceListener:onRequestPowerOff()
     UIManager:askForPowerOff()
-end
-
-function DeviceListener:onExit(callback)
-    self.ui.menu:exitOrRestart(callback)
 end
 
 function DeviceListener:onFullRefresh()

@@ -16,6 +16,10 @@ local NetworkListener = EventListener:extend{
     _activity_check_delay_seconds = nil,
 }
 
+if not Device:hasWifiToggle() then
+    return NetworkListener
+end
+
 local function enableWifi()
     local toggle_im = InfoMessage:new{
         text = _("Turning on Wi-Fi…"),
@@ -26,7 +30,7 @@ local function enableWifi()
     -- NB Normal widgets should use NetworkMgr:promptWifiOn()
     -- (or, better yet, the NetworkMgr:beforeWifiAction wrappers: NetworkMgr:runWhenOnline() & co.)
     -- This is specifically the toggle Wi-Fi action, so consent is implied.
-    NetworkMgr:enableWifi(nil, nil, nil, true) -- flag it as interactive
+    NetworkMgr:enableWifi(nil, true) -- flag it as interactive
 
     UIManager:close(toggle_im)
 end
@@ -173,13 +177,12 @@ end
 
 function NetworkListener:onNetworkConnected()
     logger.dbg("NetworkListener: onNetworkConnected")
-    if Device:hasWifiToggle() then
-        -- This is for the sake of events that don't emanate from NetworkMgr itself (e.g., the Emu)...
-        NetworkMgr:setWifiState(true)
-        NetworkMgr:setConnectionState(true)
-    end
+    -- This is for the sake of events that don't emanate from NetworkMgr itself (e.g., the Emu)...
+    NetworkMgr:setWifiState(true)
+    NetworkMgr:setConnectionState(true)
 
-    if not G_reader_settings:isTrue("auto_disable_wifi") then
+    -- You can't set auto_disable_wifi on devices without getNetworkInterfaceName() but guard against it in case it was accidentally set anyway.
+    if not NetworkMgr:getNetworkInterfaceName() or not G_reader_settings:isTrue("auto_disable_wifi") then
         return
     end
 
@@ -190,10 +193,8 @@ end
 
 function NetworkListener:onNetworkDisconnected()
     logger.dbg("NetworkListener: onNetworkDisconnected")
-    if Device:hasWifiToggle() then
-        NetworkMgr:setWifiState(false)
-        NetworkMgr:setConnectionState(false)
-    end
+    NetworkMgr:setWifiState(false)
+    NetworkMgr:setConnectionState(false)
 
     NetworkListener:_unscheduleActivityCheck()
     -- Reset NetworkMgr's beforeWifiAction marker

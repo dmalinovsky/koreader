@@ -22,6 +22,7 @@ end
 
 local Cervantes = Generic:extend{
     model = "Cervantes",
+    ota_model = "cervantes",
     isCervantes = yes,
     isAlwaysPortrait = yes,
     isTouchDevice = yes,
@@ -122,9 +123,9 @@ function Cervantes:init()
             [116] = "Power",
         }
     }
-    self.input.open("/dev/input/event0") -- Keys
-    self.input.open("/dev/input/event1") -- touchscreen
-    self.input.open("fake_events") -- usb events
+    self.input:open("/dev/input/event0") -- Keys
+    self.input:open("/dev/input/event1") -- touchscreen
+    self.input:open("fake_events") -- usb events
     self:initEventAdjustHooks()
     Generic.init(self)
 end
@@ -193,6 +194,12 @@ function Cervantes:reboot()
 end
 function Cervantes:powerOff()
     os.execute("sleep 1 && halt &")
+end
+
+function Cervantes:isStartupScriptUpToDate()
+    local md5 = require("ffi/MD5")
+    -- Compare the hash of the *active* script to the *potential* one.
+    return md5.sumFile("/tmp/koreader.sh") == md5.sumFile("koreader.sh")
 end
 
 -- This method is the same as the one in kobo/device.lua except the sleep cover part.

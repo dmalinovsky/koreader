@@ -2,18 +2,18 @@
     This module implements calibre metadata searching.
 --]]
 
+local BookList = require("ui/widget/booklist")
 local CalibreMetadata = require("metadata")
 local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
 local Device = require("device")
 local FileManagerBookInfo = require("apps/filemanager/filemanagerbookinfo")
-local filemanagerutil = require("apps/filemanager/filemanagerutil")
 local InputDialog = require("ui/widget/inputdialog")
 local InfoMessage = require("ui/widget/infomessage")
-local Menu = require("ui/widget/menu")
 local Persist = require("persist")
 local Screen = require("device").screen
 local UIManager = require("ui/uimanager")
+local Utf8Proc = require("ffi/utf8proc")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
@@ -60,7 +60,7 @@ end
 -- check if a string matches a query
 local function match(str, query, case_insensitive)
     if query and case_insensitive then
-        return string.find(string.upper(str), string.upper(query))
+        return string.find(Utf8Proc.lowercase(util.fixUtf8(str, "?")), Utf8Proc.lowercase(util.fixUtf8(query, "?")))
     elseif query then
         return string.find(str, query)
     else
@@ -141,10 +141,10 @@ local function getBookInfo(book)
         end
         return id
     end
-    -- all entries can be empty, except size, which is always filled by calibre.
-    local title = _("Title:") .. " " .. book.title or "-"
-    local authors = _("Author(s):") .. " " .. getEntries(book.authors) or "-"
-    local size = _("Size:") .. " " .. util.getFriendlySize(book.size) or _("Unknown")
+    -- All entries can be empty.
+    local title = _("Title:") .. " " .. (book.title or "-")
+    local authors = _("Author(s):") .. " " .. (getEntries(book.authors) or "-")
+    local size = _("Size:") .. " " .. (util.getFriendlySize(book.size) or _("Unknown"))
     local tags = getEntries(book.tags)
     if tags then
         tags = _("Tags:") .. " " .. tags
@@ -275,9 +275,9 @@ function CalibreSearch:onMenuHold(item)
     if not item.info or item.info:len() <= 0 then return end
     local thumbnail = FileManagerBookInfo:getCoverImage(nil, item.path)
     local thumbwidth = math.min(300, Screen:getWidth()/3)
-    local status = filemanagerutil.getStatus(item.path)
+    local status_string = BookList.getBookStatusString(BookList.getBookStatus(item.path), true, true)
     UIManager:show(InfoMessage:new{
-        text = item.info .. "\nStatus: " .. filemanagerutil.statusToString(status),
+        text = item.info .. "\n" .. status_string,
         image = thumbnail,
         image_width = thumbwidth,
         image_height = thumbwidth/2*3
@@ -316,7 +316,7 @@ function CalibreSearch:bookCatalog(t, option)
     end
     if series and not subseries then
         for index, entry in ipairs(catalog) do
-            catalog[index].text = entry.text:gsub(".00", "", 1)
+            catalog[index].text = entry.text:gsub("%.00", "", 1)
         end
     end
     return catalog
@@ -372,7 +372,7 @@ function CalibreSearch:findBooks(query)
     local function bookMatch(s, p)
         if not s or not p then return false end
         if self.case_insensitive then
-            return string.match(string.upper(s), string.upper(p))
+            return string.find(Utf8Proc.lowercase(util.fixUtf8(s, "?")), Utf8Proc.lowercase(util.fixUtf8(p, "?")))
         else
             return string.match(s, p)
         end
@@ -453,11 +453,8 @@ function CalibreSearch:browse(option)
         end
     end
 
-    self.search_menu = self.search_menu or Menu:new{
-        width = Screen:getWidth(),
-        height = Screen:getHeight(),
+    self.search_menu = BookList:new{
         parent = nil,
-        is_borderless = true,
         onMenuHold = self.onMenuHold,
     }
     self.search_menu.paths = {}

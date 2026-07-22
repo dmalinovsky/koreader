@@ -19,6 +19,7 @@ local function copyPageState(page_state)
         zoom = page_state.zoom,
         rotation = page_state.rotation,
         gamma = page_state.gamma,
+        saturation = page_state.saturation,
         offset = page_state.offset:copy(),
         visible_area = page_state.visible_area:copy(),
         page_area = page_state.page_area:copy(),
@@ -51,79 +52,37 @@ end
 function ReaderPaging:onGesture() end
 
 function ReaderPaging:registerKeyEvents()
-    if Device:hasKeys() then
-        self.key_events.GotoNextPage = {
-            { { "RPgFwd", "LPgFwd", not Device:hasFewKeys() and "Right" } },
-            event = "GotoViewRel",
-            args = 1,
-        }
-        self.key_events.GotoPrevPage = {
-            { { "RPgBack", "LPgBack", not Device:hasFewKeys() and "Left" } },
-            event = "GotoViewRel",
-            args = -1,
-        }
-        self.key_events.GotoNextPos = {
-            { "Down" },
-            event = "GotoPosRel",
-            args = 1,
-        }
-        self.key_events.GotoPrevPos = {
-            { "Up" },
-            event = "GotoPosRel",
-            args = -1,
-        }
+    local prev_key, next_key = "Left", "Right"
+    if BD.mirroredUILayout() then
+        next_key, prev_key = prev_key, next_key
     end
-    if Device:hasKeyboard() then
-        self.key_events.GotoFirst = {
-            { "1" },
-            event = "GotoPercent",
-            args = 0,
-        }
-        self.key_events.Goto11 = {
-            { "2" },
-            event = "GotoPercent",
-            args = 11,
-        }
-        self.key_events.Goto22 = {
-            { "3" },
-            event = "GotoPercent",
-            args = 22,
-        }
-        self.key_events.Goto33 = {
-            { "4" },
-            event = "GotoPercent",
-            args = 33,
-        }
-        self.key_events.Goto44 = {
-            { "5" },
-            event = "GotoPercent",
-            args = 44,
-        }
-        self.key_events.Goto55 = {
-            { "6" },
-            event = "GotoPercent",
-            args = 55,
-        }
-        self.key_events.Goto66 = {
-            { "7" },
-            event = "GotoPercent",
-            args = 66,
-        }
-        self.key_events.Goto77 = {
-            { "8" },
-            event = "GotoPercent",
-            args = 77,
-        }
-        self.key_events.Goto88 = {
-            { "9" },
-            event = "GotoPercent",
-            args = 88,
-        }
-        self.key_events.GotoLast = {
-            { "0" },
-            event = "GotoPercent",
-            args = 100,
-        }
+    if Device:hasDPad() and Device:useDPadAsActionKeys() then
+        if G_reader_settings:isTrue("left_right_keys_turn_pages") then
+            self.key_events.GotoNextPage = { { { "RPgFwd", "LPgFwd", next_key, " " } }, event = "GotoViewRel", args = 1, }
+            self.key_events.GotoPrevPage = { { { "RPgBack", "LPgBack", prev_key } }, event = "GotoViewRel", args = -1, }
+        elseif G_reader_settings:nilOrFalse("left_right_keys_turn_pages") then
+            self.key_events.GotoNextChapter = { { next_key }, event = "GotoNextChapter", args = 1, }
+            self.key_events.GotoPrevChapter = { { prev_key }, event = "GotoPrevChapter", args = -1, }
+            self.key_events.GotoNextPage = { { { "RPgFwd", "LPgFwd", " " } }, event = "GotoViewRel", args = 1, }
+            self.key_events.GotoPrevPage = { { { "RPgBack", "LPgBack" } }, event = "GotoViewRel", args = -1, }
+        end
+    elseif Device:hasKeys() then
+        self.key_events.GotoNextPage = { { { "RPgFwd", "LPgFwd", not Device:hasFewKeys() and next_key } }, event = "GotoViewRel", args = 1, }
+        self.key_events.GotoPrevPage = { { { "RPgBack", "LPgBack", not Device:hasFewKeys() and prev_key } }, event = "GotoViewRel", args = -1, }
+        self.key_events.GotoNextPos = { { "Down" }, event = "GotoPosRel", args = 1, }
+        self.key_events.GotoPrevPos = { { "Up" }, event = "GotoPosRel", args = -1, }
+    end
+    if Device:hasKeyboard() and not Device.k3_alt_plus_key_kernel_translated then
+        self.key_events.GotoFirst = { { "1" }, event = "GotoPercent", args = 0,   }
+        self.key_events.Goto11    = { { "2" }, event = "GotoPercent", args = 11,  }
+        self.key_events.Goto22    = { { "3" }, event = "GotoPercent", args = 22,  }
+        self.key_events.Goto33    = { { "4" }, event = "GotoPercent", args = 33,  }
+        self.key_events.Goto44    = { { "5" }, event = "GotoPercent", args = 44,  }
+        self.key_events.Goto55    = { { "6" }, event = "GotoPercent", args = 55,  }
+        self.key_events.Goto66    = { { "7" }, event = "GotoPercent", args = 66,  }
+        self.key_events.Goto77    = { { "8" }, event = "GotoPercent", args = 77,  }
+        self.key_events.Goto88    = { { "9" }, event = "GotoPercent", args = 88,  }
+        self.key_events.Goto99    = { { "0" }, event = "GotoPercent", args = 100, }
     end
 end
 
@@ -131,6 +90,10 @@ ReaderPaging.onPhysicalKeyboardConnected = ReaderPaging.registerKeyEvents
 
 function ReaderPaging:onReaderReady()
     self:setupTouchZones()
+     -- Statistics plugin updates the footer later, if enabled
+    if not (self.ui.statistics and self.ui.statistics.settings.is_enabled) then
+        self.view.footer:onUpdateFooter()
+    end
 end
 
 function ReaderPaging:setupTouchZones()
@@ -197,7 +160,7 @@ function ReaderPaging:onSaveSettings()
     --- @todo only save current_page page position
     self.ui.doc_settings:saveSetting("page_positions", self.page_positions)
     self.ui.doc_settings:saveSetting("last_page", self:getTopPage())
-    self.ui.doc_settings:saveSetting("percent_finished", self:getLastPercent())
+    self.ui.doc_settings:saveSetting("percent_finished", self.view.footer.percent_finished)
     self.ui.doc_settings:saveSetting("flipping_zoom_mode", self.flipping_zoom_mode)
     self.ui.doc_settings:saveSetting("flipping_scroll_mode", self.flipping_scroll_mode)
 end
@@ -336,6 +299,39 @@ function ReaderPaging:bookmarkFlipping(flipping_page, flipping_ges)
         self.ui:handleEvent(Event:new("GotoNextBookmark", flipping_page))
     end
     UIManager:setDirty(self.view.dialog, "partial")
+end
+
+function ReaderPaging:enterSkimMode()
+    if self.view.document.configurable.text_wrap ~= 0 or self.view.page_scroll or self.view.zoom_mode ~= "page" then
+        self.skim_backup = {
+            text_wrap    = self.view.document.configurable.text_wrap,
+            page_scroll  = self.view.page_scroll,
+            zoom_mode    = self.view.zoom_mode,
+            current_page = self.current_page,
+            location     = self:getBookLocation(),
+            visible_area = self.visible_area,
+        }
+        self.view.document.configurable.text_wrap = 0
+        self.view.page_scroll = false
+        self.ui.zooming:onSetZoomMode("page")
+        self.ui.zooming:onReZoom()
+    end
+end
+
+function ReaderPaging:exitSkimMode()
+    if self.skim_backup then
+        self.view.document.configurable.text_wrap = self.skim_backup.text_wrap
+        self.view.page_scroll = self.skim_backup.page_scroll
+        self.ui.zooming:onSetZoomMode(self.skim_backup.zoom_mode)
+        self.ui.zooming:onReZoom()
+        if self.current_page == self.skim_backup.current_page then
+            -- if SkimToWidget is closed on the start page, restore exact location
+            self.current_page = 0 -- do not emit extra PageUpdate event
+            self:onRestoreBookLocation(self.skim_backup.location)
+        end
+        self.visible_area = self.skim_backup.visible_area
+        self.skim_backup = nil
+    end
 end
 
 function ReaderPaging:onScrollSettingsUpdated(scroll_method, inertial_scroll_enabled, scroll_activation_delay_ms)
@@ -565,19 +561,23 @@ function ReaderPaging:onGotoPercent(percent)
     if dest > self.number_of_pages then
         dest = self.number_of_pages
     end
-    self:onGotoPage(dest)
+    self:_gotoPage(dest)
     return true
 end
 
-function ReaderPaging:onGotoViewRel(diff)
+function ReaderPaging:onGotoViewRel(diff, no_page_turn)
+    -- When called via a key event, the second arg is a key object (table), not used here.
+    no_page_turn = no_page_turn == true and true or nil
+    -- ReaderSearch calls with no_page_turn = true.
+    -- In that case, don't turn page if it would happen, and return ret=nil.
+    local ret
     if self.view.page_scroll then
-        self:onScrollPageRel(diff)
+        ret = self:onScrollPageRel(diff, no_page_turn)
     else
-        self:onGotoPageRel(diff)
+        ret = self:onGotoPageRel(diff, no_page_turn)
     end
-    self.ui:handleEvent(Event:new("PageChangeAnimation", diff > 0))
     self:setPagePosition(self:getTopPage(), self:getTopPosition())
-    return true
+    return ret
 end
 
 function ReaderPaging:onGotoPosRel(diff)
@@ -604,17 +604,20 @@ function ReaderPaging:getBookLocation()
     if ctx then
         -- We need a copy, as we're getting references to
         -- objects ReaderPaging/ReaderView may still modify
-        local current_location = {}
-        for i=1, #ctx do
-            current_location[i] = util.tableDeepCopy(ctx[i])
-        end
+        local current_location = util.tableDeepCopy(ctx)
         return current_location
     end
 end
 
 function ReaderPaging:onRestoreBookLocation(saved_location)
+    if not saved_location or not saved_location[1] then
+        return
+    end
+    -- We need a copy, as we will assign this to ReaderView.state
+    -- which when modified would change our instance on ReaderLink.location_stack
+    local ctx = util.tableDeepCopy(saved_location)
     if self.view.page_scroll then
-        if self.view:restoreViewContext(saved_location) then
+        if self.view:restoreViewContext(ctx) then
             self:_gotoPage(saved_location[1].page, "scrolling")
         else
             -- If context is unusable (not from scroll mode), trigger
@@ -629,7 +632,7 @@ function ReaderPaging:onRestoreBookLocation(saved_location)
         -- PageUpdate event - so we need to do it for a correct redrawing
         local send_PageUpdate = saved_location[1].page == self.current_page
         self:_gotoPage(saved_location[1].page)
-        if not self.view:restoreViewContext(saved_location) then
+        if not self.view:restoreViewContext(ctx) then
             -- If context is unusable (not from page mode), also
             -- send PageUpdate event to go to its page and redraw it
             send_PageUpdate = true
@@ -678,7 +681,7 @@ function ReaderPaging:onInitScrollPageStates(orig_mode)
         blank_area:setSizeTo(self.view.visible_area)
         while blank_area.h > 0 do
             local offset = Geom:new()
-            -- caculate position in current page
+            -- calculate position in current page
             if self.current_page == self.orig_page then
                 local page_area = self.view:getPageArea(
                     self.view.state.page,
@@ -716,6 +719,13 @@ function ReaderPaging:onUpdateScrollPageGamma(gamma)
     return true
 end
 
+function ReaderPaging:onUpdateScrollPageSaturation(saturation)
+    for _, state in ipairs(self.view.page_states) do
+        state.saturation = saturation
+    end
+    return true
+end
+
 function ReaderPaging:getNextPageState(blank_area, image_offset)
     local page_area = self.view:getPageArea(
         self.view.state.page,
@@ -736,6 +746,7 @@ function ReaderPaging:getNextPageState(blank_area, image_offset)
         zoom = self.view.state.zoom,
         rotation = self.view.state.rotation,
         gamma = self.view.state.gamma,
+        saturation = self.view.state.saturation,
         offset = page_offset,
         visible_area = visible_area,
         page_area = page_area,
@@ -763,6 +774,7 @@ function ReaderPaging:getPrevPageState(blank_area, image_offset)
         zoom = self.view.state.zoom,
         rotation = self.view.state.rotation,
         gamma = self.view.state.gamma,
+        saturation = self.view.state.saturation,
         offset = page_offset,
         visible_area = visible_area,
         page_area = page_area,
@@ -897,7 +909,8 @@ function ReaderPaging:onScrollPanRel(diff)
     return true
 end
 
-function ReaderPaging:onScrollPageRel(page_diff)
+function ReaderPaging:onScrollPageRel(page_diff, no_page_turn)
+    if no_page_turn then return end -- see ReaderPaging:onGotoViewRel
     if page_diff == 0 then return true end
     if page_diff > 1 or page_diff < -1  then
         -- More than 1 page, don't bother with how far we've scrolled.
@@ -941,7 +954,7 @@ function ReaderPaging:onScrollPageRel(page_diff)
     return true
 end
 
-function ReaderPaging:onGotoPageRel(diff)
+function ReaderPaging:onGotoPageRel(diff, no_page_turn)
     logger.dbg("goto relative page:", diff)
     local new_va = self.visible_area:copy()
     local x_pan_off, y_pan_off = 0, 0
@@ -1026,10 +1039,12 @@ function ReaderPaging:onGotoPageRel(diff)
             new_page = self.current_page + diff
         end
         if new_page > self.number_of_pages then
+            if no_page_turn then return true end
             self.ui:handleEvent(Event:new("EndOfBook"))
             goto_end(y)
             goto_end(x)
         elseif new_page > 0 then
+            if no_page_turn then return true end
             -- Be sure that the new and old view areas are reset so that no value is carried over to next page.
             -- Without this, we would have panned_y = new_va.y - old_va.y > 0, and panned_y will be added to the next page's y direction.
             -- This occurs when the current page has a y > 0 position (for example, a cropped page) and can fit the whole page height,
@@ -1051,6 +1066,7 @@ function ReaderPaging:onGotoPageRel(diff)
     local prev_page = self.current_page
 
     -- Handle cases when the view area gets out of page boundaries
+    local would_turn_page
     if not self.page_area:contains(new_va) then
         if not at_end(x) then
             goto_end(x)
@@ -1060,11 +1076,12 @@ function ReaderPaging:onGotoPageRel(diff)
                 if not at_end(y) then
                     goto_end(y)
                 else
-                    goto_next_page()
+                    would_turn_page = goto_next_page()
                 end
             end
         end
     end
+    if no_page_turn and would_turn_page then return end -- see ReaderPaging:onGotoViewRel
 
     if self.current_page == prev_page then
         -- Page number haven't changed when panning inside a page,
@@ -1128,11 +1145,8 @@ function ReaderPaging:_gotoPage(number, orig_mode)
 end
 
 function ReaderPaging:onGotoPage(number, pos)
-    local same_page = number == self.current_page;
-    local animation_direction = number > self.current_page;
     self:setPagePosition(number, 0)
     self:_gotoPage(number)
-    self.ui:handleEvent(Event:new("PageChangeAnimation", animation_direction))
     if pos then
         local rect_p = Geom:new{ x = pos.x or 0, y = pos.y or 0 }
         local rect_s = Geom:new(rect_p):copy()
@@ -1142,7 +1156,7 @@ function ReaderPaging:onGotoPage(number, pos)
         else
             self.view:PanningUpdate(rect_s.x - self.view.visible_area.x, rect_s.y - self.view.visible_area.y)
         end
-    elseif same_page then
+    elseif number == self.current_page then
         -- gotoPage emits this event only if the page changes
         self.ui:handleEvent(Event:new("PageUpdate", self.current_page))
     end
@@ -1161,14 +1175,14 @@ function ReaderPaging:onGotoRelativePage(number)
         end
         new_page = test_page
     end
-    self:onGotoPage(new_page)
+    self:_gotoPage(new_page)
     return true
 end
 
 function ReaderPaging:onGotoPercentage(percentage)
     if percentage < 0 then percentage = 0 end
     if percentage > 1 then percentage = 1 end
-    self:onGotoPage(math.floor(percentage*self.number_of_pages))
+    self:_gotoPage(math.floor(percentage*self.number_of_pages))
     return true
 end
 

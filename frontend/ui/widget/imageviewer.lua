@@ -95,6 +95,10 @@ function ImageViewer:init()
                 Close = { { Device.input.group.Back } },
                 ZoomIn = { { Device.input.group.PgBack } },
                 ZoomOut = { { Device.input.group.PgFwd } },
+                PanUp = { { "Up" }, event = "CursorPan", args="up" },
+                PanDown = { { "Down" }, event = "CursorPan", args="down" },
+                PanLeft = { { "Left" }, event = "CursorPan", args="left" },
+                PanRight = { { "Right" }, event = "CursorPan", args="right" },
             }
         end
     end
@@ -369,13 +373,15 @@ function ImageViewer:update()
     self.main_frame.radius = not self.fullscreen and 8 or nil
 
     -- NOTE: We use UI instead of partial, because we do NOT want to end up using a REAGL waveform...
+    --       ...except on Kaleido panels ;).
+    local wfm_mode = Device:hasKaleidoWfm() and "partial" or "ui"
     -- NOTE: Disabling dithering here makes for a perfect test-case of how well it works:
     --       page turns will show color quantization artefacts (i.e., banding) like crazy,
     --       while a long touch will trigger a dithered, flashing full-refresh that'll make everything shiny :).
     self.dithered = true
     UIManager:setDirty(self, function()
         local update_region = self.main_frame.dimen:combine(orig_dimen)
-        return "ui", update_region, true
+        return wfm_mode, update_region, true
     end)
 end
 
@@ -435,7 +441,7 @@ function ImageViewer:_new_image_wg()
     self._image_wg = ImageWidget:new{
         file = self.file,
         image = self.image,
-        image_disposable = false, -- we may re-use self.image
+        image_disposable = false, -- we may reuse self.image
         file_do_cache = false,
         alpha = true, -- we might be showing images with an alpha channel (e.g., from Wikipedia)
         width = max_image_w,
@@ -464,6 +470,9 @@ function ImageViewer:onShow()
 end
 
 function ImageViewer:switchToImageNum(image_num)
+    if image_num == self._images_list_cur then
+        return
+    end
     if self.image and self.image_disposable and self.image.free then
         logger.dbg("ImageViewer:switchToImageNum: free self.image", self.image)
         self.image:free()
@@ -546,6 +555,22 @@ function ImageViewer:panBy(x, y)
         -- so we'll be centered the same way when we zoom in or out
         self._center_x_ratio, self._center_y_ratio = self._image_wg:panBy(x, y)
     end
+end
+
+function ImageViewer:onCursorPan(direction)
+    local step_h = Screen:getWidth() / 10
+    local step_v = Screen:getHeight() / 10
+
+    if direction == "up" then
+        self:panBy(0, -step_v)
+    elseif direction == "down" then
+        self:panBy(0, step_v)
+    elseif direction == "left" then
+        self:panBy(-step_h, 0)
+    elseif direction == "right" then
+        self:panBy(step_h, 0)
+    end
+    return true
 end
 
 -- Panning events
@@ -826,7 +851,7 @@ function ImageViewer:onCloseWidget()
     -- Our ImageWidget (self._image_wg) is always a proper child widget, so it'll receive this event,
     -- and attempt to free its resources accordingly.
     -- But, if it didn't have to touch the original BB (self.image) passed to ImageViewer (e.g., no scaling needed),
-    -- it will *re-use* self.image, and flag it as non-disposable, meaning it will not have been free'd earlier.
+    -- it will *reuse* self.image, and flag it as non-disposable, meaning it will not have been free'd earlier.
     -- Since we're the ones who ultimately truly know whether we should dispose of self.image or not, do that now ;).
     if self.image and self.image_disposable and self.image.free then
         logger.dbg("ImageViewer:onCloseWidget: free self.image", self.image)
@@ -842,6 +867,7 @@ function ImageViewer:onCloseWidget()
         self._scaled_image_func(false) -- invoke :free() on the creimage object
         self._scaled_image_func = nil
     end
+    self._image_wg = nil
 
     -- Those, on the other hand, are always initialized, but may not actually be in our widget tree right now,
     -- depending on what we needed to show, so they might not get sent a CloseWidget event.

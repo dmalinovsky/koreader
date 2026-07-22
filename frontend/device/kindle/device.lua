@@ -3,7 +3,6 @@ local UIManager
 local time = require("ui/time")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
-local util = require("util")
 
 -- We're going to need a few <linux/fb.h> & <linux/input.h> constants...
 local ffi = require("ffi")
@@ -11,14 +10,267 @@ local C = ffi.C
 require("ffi/linux_fb_h")
 require("ffi/linux_input_h")
 require("ffi/posix_h")
+require("ffi/fbink_input_h")
 
 local function yes() return true end
 local function no() return false end  -- luacheck: ignore
 
+-- Try to detect WARIO+ Kindle boards (i.MX6 & i.MX7)
+local function isWarioOrMore()
+    local cpu_hw = nil
+    -- Parse cpuinfo line by line, until we find the Hardware description
+    for line in io.lines("/proc/cpuinfo") do
+        if line:find("^Hardware") then
+            cpu_hw = line:match("^Hardware%s*:%s([%g%s]*)$")
+        end
+    end
+    -- NOTE: I couldn't dig up a cpuinfo dump from an Oasis 2 to check the CPU part value,
+    --       but for Wario (Cortex A9), matching that to 0xc09 would work, too.
+    --       On the other hand, I'm already using the Hardware match in MRPI, so, that sealed the deal ;).
+
+    -- If we've got a Hardware string, check if it mentions an i.MX 6 or 7 or a MTK...
+    if cpu_hw then
+        if cpu_hw:find("i%.MX%s?[6-7]") or cpu_hw:find("MT8110") then
+            return true
+        else
+            return false
+        end
+    else
+        return false
+    end
+end
+
+-- Try to detect Kindle running hardfp firmware
+local function isHardFP()
+    local util = require("util")
+    return util.pathExists("/lib/ld-linux-armhf.so.3")
+end
+
+local function kindleGetSavedNetworks()
+    local haslipc, lipc = pcall(require, "libopenlipclua") -- use our lua lipc library with access to hasharray properties
+    local lipc_handle
+    if haslipc then
+        lipc_handle = lipc.open_no_name()
+    end
+    if lipc_handle then
+        local ha_input = lipc_handle:new_hasharray() -- an empty hash array since we only want to read
+        local success, ha_result = pcall(function()
+            return lipc_handle:access_hash_property("com.lab126.wifid", "profileData", ha_input)
+        end)
+        if success then
+            local profiles = ha_result:to_table()
+            ha_result:destroy()
+            ha_input:destroy()
+            lipc_handle:close()
+            return profiles
+        else
+            logger.warn("kindleGetSavedNetworks: failed to access profileData")
+            ha_input:destroy()
+            lipc_handle:close()
+            return {}
+        end
+    end
+end
+
+local function kindleGetCurrentProfile()
+    local haslipc, lipc = pcall(require, "libopenlipclua") -- use our lua lipc library with access to hasharray properties
+    local lipc_handle
+    if haslipc then
+        lipc_handle = lipc.open_no_name()
+    end
+    if lipc_handle then
+        local ha_input = lipc_handle:new_hasharray() -- an empty hash array since we only want to read
+        local success, ha_result = pcall(function()
+            return lipc_handle:access_hash_property("com.lab126.wifid", "currentEssid", ha_input)
+        end)
+
+        if success then
+            local profile = ha_result:to_table()[1] -- there is only a single element
+            ha_input:destroy()
+            ha_result:destroy()
+            lipc_handle:close()
+            return profile
+        else
+            logger.warn("kindleGetCurrentProfile: failed to access currentEssid")
+            ha_input:destroy()
+            lipc_handle:close()
+            return nil
+        end
+    else
+        return nil
+    end
+end
+
+local function kindleAuthenticateNetwork(essid)
+    local haslipc, lipc = pcall(require, "liblipclua")
+    local lipc_handle
+    if haslipc then
+        lipc_handle = lipc.init("com.github.koreader.networkmgr")
+    end
+    if lipc_handle then
+        lipc_handle:set_string_property("com.lab126.cmd", "ensureConnection", "wifi:" .. essid)
+        lipc_handle:close()
+    end
+end
+
+local function kindleSaveNetwork(data)
+    local haslipc, lipc = pcall(require, "libopenlipclua") -- use our lua lipc library with access to hasharray properties
+    local lipc_handle
+    if haslipc then
+        lipc_handle = lipc.open_no_name()
+    end
+    if lipc_handle then
+        local profile = lipc_handle:new_hasharray()
+        profile:add_hash()
+        profile:put_string(0, "essid", data.ssid)
+        if string.find(data.flags, "WPA") then
+            profile:put_string(0, "secured", "yes")
+            profile:put_string(0, "psk", data.password)
+            profile:put_int(0, "store_nw_user_pref", 0) -- tells amazon we don't want them to have our password
+        else
+            profile:put_string(0, "secured", "no")
+        end
+        local success, result = pcall(function()
+            return lipc_handle:access_hash_property("com.lab126.wifid", "createProfile", profile)
+        end)
+        if success then
+            result:destroy() -- destroy the returned empty ha
+        else
+            logger.warn("kindleSaveNetwork: failed to createProfile")
+        end
+        profile:destroy()
+        lipc_handle:close()
+    end
+end
+
+local function kindleGetScanList()
+    local _ = require("gettext")
+    local haslipc, lipc = pcall(require, "libopenlipclua") -- use our lua lipc library with access to hasharray properties
+    local lipc_handle
+    if haslipc then
+        lipc_handle = lipc.open_no_name()
+    end
+    if lipc_handle then
+        local success, cm_state = pcall(function()
+            return lipc_handle:get_string_property("com.lab126.wifid", "cmState")
+        end)
+        if not success then
+            -- cmState may fail when the LIPC backend is temporarily unavailable (e.g., suspend/lock).
+            logger.warn("kindleGetScanList: failed to access cmState")
+        end
+        -- Fall back to scanList if cmState is unavailable or not CONNECTED (cm_state may be nil).
+        local need_scan = (not success) or (cm_state ~= "CONNECTED")
+        if need_scan then
+            local ha_input = lipc_handle:new_hasharray()
+            local success_scan, ha_results = pcall(function()
+                return lipc_handle:access_hash_property("com.lab126.wifid", "scanList", ha_input)
+            end)
+            if not success_scan then
+                logger.warn("kindleGetScanList: failed to access scanList")
+                ha_input:destroy()
+                lipc_handle:close()
+                return {}, nil
+            end
+            if ha_results == nil then
+                -- Shouldn't really happen, access_hash_property will throw if LipcAccessHasharrayProperty failed
+                ha_input:destroy()
+                lipc_handle:close()
+                -- NetworkMgr will ask for a re-scan on seeing an empty table, the second attempt *should* work ;).
+                return {}, nil
+            end
+            local scan_result = ha_results:to_table()
+            ha_results:destroy()
+            ha_input:destroy()
+            lipc_handle:close()
+            if not scan_result then
+                -- e.g., to_table hit lha->ha == NULL
+                return {}, nil
+            else
+                return scan_result, nil
+            end
+        end
+        lipc_handle:close()
+        -- return a fake scan list containing only the currently connected profile :)
+        local profile = kindleGetCurrentProfile()
+        return { profile }, nil
+    else
+        logger.dbg("kindleGetScanList: Failed to acquire an anonymous lipc handle")
+        return nil, _("Unable to communicate with the Wi-Fi backend")
+    end
+end
+
+local function kindleScanThenGetResults()
+    local _ = require("gettext")
+    local haslipc, lipc = pcall(require, "liblipclua")
+    local lipc_handle
+    if haslipc then
+        lipc_handle = lipc.init("com.github.koreader.networkmgr")
+    end
+    if not lipc_handle then
+        logger.dbg("kindleScanThenGetResults: Failed to acquire a lipc handle for NetworkMgr")
+        return nil, _("Unable to communicate with the Wi-Fi backend")
+    end
+
+    lipc_handle:set_string_property("com.lab126.wifid", "scan", "") -- trigger a scan
+
+    -- Mimic WpaClient:scanThenGetResults: block while waiting for the scan to finish.
+    -- Ideally, we'd do this via a poll/event workflow, but, eh', this is going to be good enough for now ;p.
+    -- For future reference, see `lipc-wait-event -m -s 0 -t com.lab126.wifid '*'`
+    --[[
+        -- For a connection:
+        [00:00:04.675699] cmStateChange "PENDING"
+        [00:00:04.677402] scanning
+        [00:00:05.488043] scanComplete
+        [00:00:05.973188] cmConnected
+        [00:00:05.977862] cmStateChange "CONNECTED"
+        [00:00:05.980698] signalStrength "1/5"
+        [00:00:06.417549] cmConnected
+
+        -- And a disconnection:
+        [00:01:34.094652] cmDisconnected
+        [00:01:34.096088] cmStateChange "NA"
+        [00:01:34.219802] signalStrength "0/5"
+        [00:01:34.221802] cmStateChange "READY"
+        [00:01:35.656375] cmIntfNotAvailable
+        [00:01:35.658710] cmStateChange "NA"
+    --]]
+    local done_scanning = false
+    local wait_cnt = 80 -- 20s in chunks on 250ms
+    while wait_cnt > 0 do
+        local success, scan_state = pcall(function()
+            return lipc_handle:get_string_property("com.lab126.wifid", "scanState")
+        end)
+
+        if not success then
+            logger.warn("kindleScanThenGetResults: failed to get scanState, aborting scan")
+            break
+        end
+
+        if scan_state == "idle" then
+            done_scanning = true
+            logger.dbg("kindleScanThenGetResults: Wi-Fi scan took", (80 - wait_cnt) * 0.25, "seconds")
+            break
+        end
+
+        -- Whether it's still "scanning" or in whatever other state we don't know about,
+        -- try again until it says it's done.
+        wait_cnt = wait_cnt - 1
+        C.usleep(250 * 1000)
+    end
+    lipc_handle:close()
+
+    if done_scanning then
+        return kindleGetScanList()
+    else
+        logger.warn("kindleScanThenGetResults: Timed-out scanning for Wi-Fi networks")
+        return nil, _("Scanning for Wi-Fi networks timed out")
+    end
+end
+
 local function kindleEnableWifi(toggle)
     local haslipc, lipc = pcall(require, "liblipclua")
-    local lipc_handle = nil
-    if haslipc and lipc then
+    local lipc_handle
+    if haslipc then
         lipc_handle = lipc.init("com.github.koreader.networkmgr")
     end
     if lipc_handle then
@@ -44,8 +296,8 @@ end
 --[[
 local function isWifiUp()
     local haslipc, lipc = pcall(require, "liblipclua")
-    local lipc_handle = nil
-    if haslipc and lipc then
+    local lipc_handle
+    if haslipc then
         lipc_handle = lipc.init("com.github.koreader.networkmgr")
     end
     if lipc_handle then
@@ -77,7 +329,7 @@ Test if a kindle device is flagged as a Special Offers device (i.e., ad supporte
 local function isSpecialOffers()
     -- Look at the current blanket modules to see if the SO screensavers are enabled...
     local haslipc, lipc = pcall(require, "liblipclua")
-    if not (haslipc and lipc) then
+    if not haslipc then
         logger.warn("could not load liblipclua:", lipc)
         return true
     end
@@ -115,7 +367,7 @@ end
 local function frameworkStopped()
     if os.getenv("STOP_FRAMEWORK") == "yes" then
         local haslipc, lipc = pcall(require, "liblipclua")
-        if not (haslipc and lipc) then
+        if not haslipc then
             logger.warn("could not load liblibclua")
             return
         end
@@ -162,19 +414,27 @@ local Kindle = Generic:extend{
     canHWDither = no,
     -- Device has an Ambient Light Sensor
     hasLightSensor = no,
+    -- Device has fancy gesture detection when tapping the *frame*
+    hasFancyTaps = no,
     -- The time the device went into suspend
     suspend_time = 0,
     framework_lipc_handle = frameworkStopped(),
 }
 
 function Kindle:initNetworkManager(NetworkMgr)
-    function NetworkMgr:turnOnWifi(complete_callback)
-        kindleEnableWifi(1)
-        -- NOTE: As we defer the actual work to lipc,
-        --       we have no guarantee the Wi-Fi state will have changed by the time kindleEnableWifi returns,
-        --       so, delay the callback until we at least can ensure isConnect is true.
-        if complete_callback then
-            NetworkMgr:scheduleConnectivityCheck(complete_callback)
+    local haslipc, _ = pcall(require, "liblipclua")
+    if haslipc then
+        function NetworkMgr:turnOnWifi(complete_callback, interactive)
+            kindleEnableWifi(1)
+            return self:reconnectOrShowNetworkMenu(complete_callback, interactive)
+        end
+    else
+        -- If we can't use the lipc Lua bindings, we can't support any kind of interactive Wi-Fi UI...
+        function NetworkMgr:turnOnWifi(complete_callback, interactive)
+            kindleEnableWifi(1)
+            if complete_callback then
+                complete_callback()
+            end
         end
     end
 
@@ -194,6 +454,72 @@ function Kindle:initNetworkManager(NetworkMgr)
         kindleEnableWifi(1)
     end
 
+    function NetworkMgr:authenticateNetwork(network)
+        kindleAuthenticateNetwork(network.ssid)
+        return true, nil
+    end
+
+    -- NOTE: We don't have a disconnectNetwork & releaseIP implementation,
+    --       which means the "disconnect" button in NetworkSetting kind of does nothing ;p.
+
+    function NetworkMgr:saveNetwork(setting)
+        kindleSaveNetwork(setting)
+    end
+
+    function NetworkMgr:getNetworkList()
+        local scan_list, err = kindleScanThenGetResults()
+        if not scan_list then
+            return nil, err
+        end
+
+         -- trick ui/widget/networksetting into displaying the correct signal strength icon
+        local qualities = {
+            [1] = 0,
+            [2] = 6,
+            [3] = 31,
+            [4] = 56,
+            [5] = 81
+        }
+
+        local network_list = {}
+        local saved_profiles = kindleGetSavedNetworks()
+        local current_profile = kindleGetCurrentProfile()
+        for _, network in ipairs(scan_list) do
+            local password = nil
+            if network.known == "yes" then
+                for _, p in ipairs(saved_profiles) do
+                    -- Earlier FW do not have a netid field at all, fall back to essid as that's the best we'll get (we don't get bssid either)...
+                    if (p.netid and p.netid == network.netid) or (p.netid == nil and p.essid == network.essid) then
+                        password = p.psk
+                        break
+                    end
+                end
+            end
+            table.insert(network_list, {
+                -- signal_level is purely for fun, the widget doesn't do anything with it. The WpaClient backend stores the raw dBa attenuation in it.
+                signal_level = string.format("%d/%d", network.signal, network.signal_max),
+                signal_quality = qualities[network.signal],
+                -- See comment above about netid being unfortunately optional...
+                connected = current_profile and ((current_profile.netid and current_profile.netid ~= -1 and current_profile.netid == network.netid)
+                         or (current_profile.netid == nil and current_profile.essid ~= "" and current_profile.essid == network.essid)),
+                flags = network.key_mgmt,
+                ssid = network.essid ~= "" and network.essid,
+                password = password,
+            })
+        end
+        return network_list, nil
+    end
+
+    function NetworkMgr:getCurrentNetwork()
+        local nw = kindleGetCurrentProfile()
+        if nw == nil then
+            logger.dbg("NetworkMgr:getCurrentNetwork: No current network profile found")
+            return nil
+        end
+        logger.dbg("NetworkMgr:getCurrentNetwork: Current network:", nw.essid)
+        return { ssid = nw.essid }
+    end
+
     NetworkMgr.isWifiOn = NetworkMgr.sysfsWifiOn
     NetworkMgr.isConnected = NetworkMgr.ifHasAnAddress
 end
@@ -204,6 +530,103 @@ function Kindle:supportsScreensaver()
     else
         return true
     end
+end
+
+function Kindle:openInputDevices()
+    -- Auto-detect input devices (via FBInk's fbink_input_scan)
+    local ok, FBInkInput = pcall(ffi.loadlib, "fbink_input", 1)
+    if not ok then
+        print("fbink_input not loaded:", FBInkInput)
+        -- NOP fallback for the testsuite...
+        FBInkInput = { fbink_input_scan = function() end }
+    end
+    local dev_count = ffi.new("size_t[1]")
+    -- We care about: the touchscreen, a properly scaled stylus, pagination buttons, a home button, a fiveway; and the fancy "tap on frame" stuff.
+    local match_mask = bit.bor(C.INPUT_TOUCHSCREEN, C.INPUT_SCALED_TABLET, C.INPUT_PAGINATION_BUTTONS, C.INPUT_HOME_BUTTON, C.INPUT_DPAD, C.INPUT_KINDLE_FRAME_TAP)
+    local devices = FBInkInput.fbink_input_scan(match_mask, 0, 0, dev_count)
+    if devices ~= nil then
+        for i = 0, tonumber(dev_count[0]) - 1 do
+            local dev = devices[i]
+            if dev.matched then
+                self.input:fdopen(tonumber(dev.fd), ffi.string(dev.path), ffi.string(dev.name))
+
+                -- Automagically flip the hasFancyTaps cap
+                if bit.band(dev.type, C.INPUT_KINDLE_FRAME_TAP) ~= 0 then
+                    self.hasFancyTaps = yes
+                end
+            end
+        end
+        C.free(devices)
+    else
+        -- Auto-detection failed, warn and fall back to defaults
+        logger.warn("We failed to auto-detect the proper input devices, input handling may be inconsistent!")
+        if self.touch_dev then
+            -- We've got a preferred path specified for the touch panel
+            self.input:open(self.touch_dev)
+        else
+            -- That generally works out well enough on legacy devices...
+            self.input:open("/dev/input/event0")
+            self.input:open("/dev/input/event1")
+        end
+    end
+
+    -- Getting the device where rotation events end up without catching a bunch of false-positives is... trickier,
+    -- thanks to the inane event code being used...
+    if self:hasGSensor() then
+        -- i.e., we want something that reports EV_ABS:ABS_PRESSURE that isn't *also* a pen (because those are pretty much guaranteed to report pressure...).
+        --       And let's add that isn't also a touchscreen to the mix, because while not true at time of writing, that's an event touchscreens sure can support...
+        devices = FBInkInput.fbink_input_scan(C.INPUT_ROTATION_EVENT, bit.bor(C.INPUT_TABLET, C.INPUT_TOUCHSCREEN), C.NO_RECAP, dev_count)
+        if devices ~= nil then
+            for i = 0, tonumber(dev_count[0]) - 1 do
+                local dev = devices[i]
+                if dev.matched then
+                    self.input:fdopen(tonumber(dev.fd), ffi.string(dev.path), ffi.string(dev.name))
+                end
+            end
+            C.free(devices)
+        end
+    end
+
+    self.input:open("fake_events")
+end
+
+function Kindle:otaModel()
+    local model
+    if self:isTouchDevice() or self.model == "Kindle4" then
+        if isHardFP() then
+            model = "kindlehf"
+        elseif isWarioOrMore() then
+            model = "kindlepw2"
+        else
+            model = "kindle"
+        end
+    else
+        model = "kindle-legacy"
+    end
+    return model, "ota"
+end
+
+function Kindle:toggleKeyRepeat(toggle)
+    if toggle == true then
+        self.key_repeat[C.REP_DELAY] = 400
+        self.key_repeat[C.REP_PERIOD] = 120
+
+        -- We can't easily clear existing hooks, but we can overwrite the eventAdjustHook
+        -- with the default empty implementation to effectively remove previous hooks
+        local Input = require("device/input")
+        self.input.eventAdjustHook = Input.eventAdjustHook
+    else
+        self.key_repeat[C.REP_DELAY] = 0
+        self.key_repeat[C.REP_PERIOD] = 0
+
+        -- Register an event hook that filters out KEY_REPEAT events
+        self.input:registerEventAdjustHook(function(this, ev)
+            if ev.type == C.EV_KEY and ev.value == 2 then -- KEY_REPEAT = 2
+                ev.value = -1 -- Set to an invalid value that will be ignored
+            end
+        end)
+    end
+    return true
 end
 
 function Kindle:init()
@@ -232,6 +655,42 @@ function Kindle:init()
         end
     else
         self.canDeepSleep = false
+    end
+
+    -- If the device-specific init hasn't done so already (devices without keys don't), instantiate Input.
+    if not self.input then
+        self.input = require("device/input"):new{ device = self }
+    end
+
+    -- Auto-detect & open input devices
+    self:openInputDevices()
+
+    -- Deal with the fancy "double-tap on the device frame" thingy, c.f., #14461
+    if self:hasFancyTaps() then
+        -- Make sure we setup key handlers, in case the device is otherwise touch-only
+        self.hasKeys = yes
+
+        -- And that we map the double-tap keycode properly, because, sure, F7, why not, lab126...
+        self.input.event_map[65] = "RPgFwd"
+    end
+
+    -- Follow user preference for the hall effect sensor's state
+    if self.powerd:hasHallSensor() then
+        if G_reader_settings:has("kindle_hall_effect_sensor_enabled") then
+            self.powerd:onToggleHallSensor(G_reader_settings:readSetting("kindle_hall_effect_sensor_enabled"))
+        end
+    end
+
+    if self:hasDPad() then
+        self.canKeyRepeat = yes
+        self.key_repeat = ffi.new("unsigned int[?]", C.REP_CNT)
+        if G_reader_settings:isTrue("input_no_key_repeat") then
+            self.key_repeat[C.REP_DELAY] = 0
+            self.key_repeat[C.REP_PERIOD] = 0
+        else
+            self.key_repeat[C.REP_DELAY] = 400
+            self.key_repeat[C.REP_PERIOD] = 120
+        end
     end
 
     Generic.init(self)
@@ -389,9 +848,10 @@ function Kindle:readyToSuspend(delay)
     self.suspend_time = time.boottime_or_realtime_coarse()
 end
 
--- We add --no-same-permissions --no-same-owner to make the userstore fuse proxy happy...
-function Kindle:untar(archive, extract_to)
-    return os.execute(("./tar --no-same-permissions --no-same-owner -xf %q -C %q"):format(archive, extract_to))
+function Kindle:isStartupScriptUpToDate()
+    local md5 = require("ffi/MD5")
+    -- Compare the hash of the *active* script to the *potential* one.
+    return md5.sumFile("/var/tmp/koreader.sh") == md5.sumFile("koreader.sh")
 end
 
 function Kindle:UIManagerReady(uimgr)
@@ -458,7 +918,9 @@ local Kindle2 = Kindle:extend{
     isREAGL = no,
     hasKeyboard = yes,
     hasKeys = yes,
+    hasSymKey = yes,
     hasDPad = yes,
+    useDPadAsActionKeys = yes,
     canHWInvert = no,
     canModifyFBInfo = no,
     canUseCBB = no, -- 4bpp
@@ -471,7 +933,9 @@ local KindleDXG = Kindle:extend{
     isREAGL = no,
     hasKeyboard = yes,
     hasKeys = yes,
+    hasSymKey = yes,
     hasDPad = yes,
+    useDPadAsActionKeys = yes,
     canHWInvert = no,
     canModifyFBInfo = no,
     canUseCBB = no, -- 4bpp
@@ -484,7 +948,9 @@ local Kindle3 = Kindle:extend{
     isREAGL = no,
     hasKeyboard = yes,
     hasKeys = yes,
+    hasSymKey = yes,
     hasDPad = yes,
+    useDPadAsActionKeys = yes,
     canHWInvert = no,
     canModifyFBInfo = no,
     canUseCBB = no, -- 4bpp
@@ -495,7 +961,9 @@ local Kindle4 = Kindle:extend{
     model = "Kindle4",
     isREAGL = no,
     hasKeys = yes,
+    hasScreenKB = yes,
     hasDPad = yes,
+    useDPadAsActionKeys = yes,
     canHWInvert = no,
     canModifyFBInfo = no,
     -- NOTE: It could *technically* use the C BB, as it's running @ 8bpp, but it's expecting an inverted palette...
@@ -563,6 +1031,7 @@ local KindleOasis = Kindle:extend{
     hasKeys = yes,
     hasGSensor = yes,
     display_dpi = 300,
+    hasAuxBattery = yes,
     --[[
     -- NOTE: Points to event3 on Wi-Fi devices, event4 on 3G devices...
     --       3G devices apparently have an extra SX9500 Proximity/Capacitive controller for mysterious purposes...
@@ -644,6 +1113,36 @@ local KindlePaperWhite5 = Kindle:extend{
     -- NOTE: Input device path is variable, see findInputDevices
 }
 
+local KindlePaperWhite5SE = Kindle:extend{
+    model = "KindlePaperWhite5SE", -- Signature Edition, has light sensor
+    isMTK = yes,
+    isTouchDevice = yes,
+    hasFrontlight = yes,
+    hasNaturalLight = yes,
+    hasNaturalLightMixer = yes,
+    hasLightSensor = yes,
+    display_dpi = 300,
+    canHWDither = no,
+    canDoSwipeAnimation = yes,
+}
+
+local KindlePaperWhite6 = Kindle:extend{
+    model = "KindlePaperWhite6",
+    isMTK = yes,
+    isTouchDevice = yes,
+    hasFrontlight = yes,
+    hasNaturalLight = yes,
+    -- NOTE: We *can* technically control both LEDs independently,
+    --       but the mix is device-specific, we don't have access to the LUT for the mix powerd is using,
+    --       and the widget is designed for the Kobo Aura One anyway, so, hahaha, nope.
+    hasNaturalLightMixer = yes,
+    display_dpi = 300,
+    -- NOTE: While hardware dithering (via MDP) should be a thing, it doesn't appear to do anything right now :/.
+    canHWDither = no, --- this is a guess i don't have a device to check
+    canDoSwipeAnimation = yes,
+    -- NOTE: Input device path is variable, see findInputDevices
+}
+
 local KindleBasic4 = Kindle:extend{
     model = "KindleBasic4",
     isMTK = yes,
@@ -651,6 +1150,17 @@ local KindleBasic4 = Kindle:extend{
     hasFrontlight = yes,
     display_dpi = 300,
     canHWDither = no,
+    canDoSwipeAnimation = yes,
+    -- NOTE: Like the PW5, input device path is variable, see findInputDevices
+}
+
+local KindleBasic5 = Kindle:extend{
+    model = "KindleBasic5",
+    isMTK = yes,
+    isTouchDevice = yes,
+    hasFrontlight = yes,
+    display_dpi = 300,
+    canHWDither = no, --- this is a guess i don't have a device to check
     canDoSwipeAnimation = yes,
     -- NOTE: Like the PW5, input device path is variable, see findInputDevices
 }
@@ -673,6 +1183,57 @@ local KindleScribe = Kindle:extend{
     canDoSwipeAnimation = yes,
 }
 
+local KindleScribe3 = Kindle:extend{
+    model = "KindleScribe3",
+    isMTK = yes,
+    isTouchDevice = yes,
+    hasFrontlight = yes,
+    hasNaturalLight = yes,
+    -- NOTE: We *can* technically control both LEDs independently,
+    --       but the mix is device-specific, we don't have access to the LUT for the mix powerd is using,
+    --       and the widget is designed for the Kobo Aura One anyway, so, hahaha, nope.
+    hasNaturalLightMixer = yes,
+    hasLightSensor = yes,
+    hasGSensor = yes,
+    display_dpi = 300,
+    touch_dev = "/dev/input/touch",
+    canHWDither = yes,
+    canDoSwipeAnimation = yes,
+}
+
+local KindleColorSoft = Kindle:extend{
+    model = "KindleColorSoft",
+    isMTK = yes,
+    isTouchDevice = yes,
+    hasFrontlight = yes,
+    hasNaturalLight = yes,
+    hasNaturalLightMixer = yes,
+    hasLightSensor = yes,
+    display_dpi = 300,
+    canHWDither = yes,
+    canDoSwipeAnimation = yes,
+    hasColorScreen = yes,
+}
+
+local KindleScribeColorSoft = Kindle:extend{
+    model = "KindleScribeColorSoft",
+    isMTK = yes,
+    isTouchDevice = yes,
+    hasFrontlight = yes,
+    hasNaturalLight = yes,
+    -- NOTE: We *can* technically control both LEDs independently,
+    --       but the mix is device-specific, we don't have access to the LUT for the mix powerd is using,
+    --       and the widget is designed for the Kobo Aura One anyway, so, hahaha, nope.
+    hasNaturalLightMixer = yes,
+    hasLightSensor = yes,
+    hasGSensor = yes,
+    display_dpi = 300,
+    touch_dev = "/dev/input/touch",
+    canHWDither = yes,
+    canDoSwipeAnimation = yes,
+    hasColorScreen = yes,
+}
+
 function Kindle2:init()
     self.screen = require("ffi/framebuffer_einkfb"):new{device = self, debug = logger.dbg}
     self.powerd = require("device/kindle/powerd"):new{
@@ -681,11 +1242,8 @@ function Kindle2:init()
     }
     self.input = require("device/input"):new{
         device = self,
-        event_map = require("device/kindle/event_map_keyboard"),
+        event_map = dofile("frontend/device/kindle/event_map_keyboard.lua"),
     }
-    self.input.open("/dev/input/event0")
-    self.input.open("/dev/input/event1")
-    self.input.open("fake_events")
     Kindle.init(self)
 end
 
@@ -697,12 +1255,9 @@ function KindleDXG:init()
     }
     self.input = require("device/input"):new{
         device = self,
-        event_map = require("device/kindle/event_map_keyboard"),
+        event_map = dofile("frontend/device/kindle/event_map_keyboard.lua"),
     }
-    self.keyboard_layout = require("device/kindle/keyboard_layout")
-    self.input.open("/dev/input/event0")
-    self.input.open("/dev/input/event1")
-    self.input.open("fake_events")
+    self.keyboard_layout = dofile("frontend/device/kindle/keyboard_layout.lua")
     Kindle.init(self)
 end
 
@@ -715,12 +1270,10 @@ function Kindle3:init()
     }
     self.input = require("device/input"):new{
         device = self,
-        event_map = require("device/kindle/event_map_kindle4"),
+        event_map = dofile("frontend/device/kindle/event_map_kindle4.lua"),
     }
-    self.keyboard_layout = require("device/kindle/keyboard_layout")
-    self.input.open("/dev/input/event0")
-    self.input.open("/dev/input/event1")
-    self.input.open("fake_events")
+    self.keyboard_layout = dofile("frontend/device/kindle/keyboard_layout.lua")
+    self.k3_alt_plus_key_kernel_translated = dofile("frontend/device/kindle/k3_alt_and_top_row.lua")
     Kindle.init(self)
 end
 
@@ -733,11 +1286,8 @@ function Kindle4:init()
     }
     self.input = require("device/input"):new{
         device = self,
-        event_map = require("device/kindle/event_map_kindle4"),
+        event_map = dofile("frontend/device/kindle/event_map_kindle4.lua"),
     }
-    self.input.open("/dev/input/event0")
-    self.input.open("/dev/input/event1")
-    self.input.open("fake_events")
     Kindle.init(self)
 end
 
@@ -747,6 +1297,7 @@ function KindleTouch:init()
         device = self,
         batt_capacity_file = "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_capacity",
         is_charging_file = "/sys/devices/platform/fsl-usb2-udc/charging",
+        hall_file = "/sys/devices/platform/eink_hall/hall_enable",
     }
     self.input = require("device/input"):new{
         device = self,
@@ -757,11 +1308,6 @@ function KindleTouch:init()
     -- Kindle Touch needs event modification for proper coordinates
     self.input:registerEventAdjustHook(self.input.adjustTouchScale, {x=600/4095, y=800/4095})
 
-    -- event0 in KindleTouch is "WM8962 Beep Generator" (useless)
-    -- event1 in KindleTouch is "imx-yoshi Headset" (useless)
-    self.input.open("/dev/input/event2") -- Home button
-    self.input.open(self.touch_dev) -- touchscreen
-    self.input.open("fake_events")
     Kindle.init(self)
 end
 
@@ -769,31 +1315,26 @@ function KindlePaperWhite:init()
     self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
     self.powerd = require("device/kindle/powerd"):new{
         device = self,
-        fl_intensity_file = "/sys/devices/system/fl_tps6116x/fl_tps6116x0/fl_intensity",
+        fl_intensity_files = { "/sys/devices/system/fl_tps6116x/fl_tps6116x0/fl_intensity" },
         batt_capacity_file = "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_capacity",
         is_charging_file = "/sys/devices/platform/aplite_charger.0/charging",
     }
 
     Kindle.init(self)
-
-    self.input.open(self.touch_dev)
-    self.input.open("fake_events")
 end
 
 function KindlePaperWhite2:init()
     self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
     self.powerd = require("device/kindle/powerd"):new{
         device = self,
-        fl_intensity_file = "/sys/class/backlight/max77696-bl/brightness",
+        fl_intensity_files = { "/sys/class/backlight/max77696-bl/brightness" },
         batt_capacity_file = "/sys/devices/system/wario_battery/wario_battery0/battery_capacity",
         is_charging_file = "/sys/devices/system/wario_charger/wario_charger0/charging",
+        batt_status_file = "/sys/class/power_supply/max77696-battery/status",
         hall_file = "/sys/devices/system/wario_hall/wario_hall0/hall_enable",
     }
 
     Kindle.init(self)
-
-    self.input.open(self.touch_dev)
-    self.input.open("fake_events")
 end
 
 function KindleBasic:init()
@@ -806,16 +1347,13 @@ function KindleBasic:init()
     }
 
     Kindle.init(self)
-
-    self.input.open(self.touch_dev)
-    self.input.open("fake_events")
 end
 
 function KindleVoyage:init()
     self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
     self.powerd = require("device/kindle/powerd"):new{
         device = self,
-        fl_intensity_file = "/sys/class/backlight/max77696-bl/brightness",
+        fl_intensity_files = { "/sys/class/backlight/max77696-bl/brightness" },
         batt_capacity_file = "/sys/devices/system/wario_battery/wario_battery0/battery_capacity",
         is_charging_file = "/sys/devices/system/wario_charger/wario_charger0/charging",
         hall_file = "/sys/devices/system/wario_hall/wario_hall0/hall_enable",
@@ -859,11 +1397,7 @@ function KindleVoyage:init()
 
     Kindle.init(self)
 
-    self.input.open(self.touch_dev)
-    self.input.open("/dev/input/event2") -- WhisperTouch
-    self.input.open("fake_events")
-
-    -- reenable WhisperTouch keys when started without framework
+    -- Re-enable WhisperTouch keys when started without framework
     if self.framework_lipc_handle then
         self.framework_lipc_handle:set_int_property("com.lab126.deviced", "fsrkeypadEnable", 1)
         self.framework_lipc_handle:set_int_property("com.lab126.deviced", "fsrkeypadPrevEnable", 1)
@@ -875,16 +1409,13 @@ function KindlePaperWhite3:init()
     self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
     self.powerd = require("device/kindle/powerd"):new{
         device = self,
-        fl_intensity_file = "/sys/class/backlight/max77696-bl/brightness",
+        fl_intensity_files = { "/sys/class/backlight/max77696-bl/brightness" },
         batt_capacity_file = "/sys/devices/system/wario_battery/wario_battery0/battery_capacity",
         is_charging_file = "/sys/devices/system/wario_charger/wario_charger0/charging",
         hall_file = "/sys/devices/system/wario_hall/wario_hall0/hall_enable",
     }
 
     Kindle.init(self)
-
-    self.input.open(self.touch_dev)
-    self.input.open("fake_events")
 end
 
 -- HAL for gyro orientation switches (EV_ABS:ABS_PRESSURE (?!) w/ custom values to EV_MSC:MSC_GYRO w/ our own custom values)
@@ -936,10 +1467,12 @@ function KindleOasis:init()
     self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
     self.powerd = require("device/kindle/powerd"):new{
         device = self,
-        fl_intensity_file = "/sys/class/backlight/max77696-bl/brightness",
-        -- NOTE: Points to the embedded battery. The one in the cover is codenamed "soda".
+        fl_intensity_files = { "/sys/class/backlight/max77696-bl/brightness" },
+        -- NOTE: Points to the embedded battery. The one in the cover is codenamed "soda", see aux_batt_capacity_file below.
         batt_capacity_file = "/sys/devices/system/wario_battery/wario_battery0/battery_capacity",
         is_charging_file = "/sys/devices/system/wario_charger/wario_charger0/charging",
+        aux_batt_capacity_file = "/sys/devices/platform/soda/power_supply/soda_fg/capacity",
+        aux_batt_status_file = "/sys/devices/platform/soda/power_supply/soda_fg/status",
         hall_file = "/sys/devices/system/wario_hall/wario_hall0/hall_enable",
     }
 
@@ -956,7 +1489,7 @@ function KindleOasis:init()
 
     --- @note See comments in KindleOasis2:init() for details.
     local haslipc, lipc = pcall(require, "liblipclua")
-    if haslipc and lipc then
+    if haslipc then
         local lipc_handle = lipc.init("com.github.koreader.screen")
         if lipc_handle then
             local orientation_code = lipc_handle:get_string_property(
@@ -992,21 +1525,6 @@ function KindleOasis:init()
             return this:handleGyroEv(ev)
         end
     end
-
-    self.input.open(self.touch_dev)
-    self.input.open("/dev/input/by-path/platform-gpiokey.0-event")
-
-    -- get rotate dev by EV=d
-    local std_out = io.popen("grep -e 'Handlers\\|EV=' /proc/bus/input/devices | grep -B1 'EV=d' | grep -o 'event[0-9]'", "r")
-    if std_out then
-        local rotation_dev = std_out:read("*line")
-        std_out:close()
-        if rotation_dev then
-            self.input.open("/dev/input/"..rotation_dev)
-        end
-    end
-
-    self.input.open("fake_events")
 end
 
 -- HAL for gyro orientation switches (EV_ABS:ABS_PRESSURE (?!) w/ custom values to EV_MSC:MSC_GYRO w/ our own custom values)
@@ -1053,7 +1571,7 @@ function KindleOasis2:init()
     self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
     self.powerd = require("device/kindle/powerd"):new{
         device = self,
-        fl_intensity_file = "/sys/class/backlight/max77796-bl/brightness",
+        fl_intensity_files = { "/sys/class/backlight/max77796-bl/brightness" },
         batt_capacity_file = "/sys/class/power_supply/max77796-battery/capacity",
         is_charging_file = "/sys/class/power_supply/max77796-charger/charging",
         batt_status_file = "/sys/class/power_supply/max77796-charger/status",
@@ -1082,7 +1600,7 @@ function KindleOasis2:init()
     -- NOTE: It'd take some effort to actually start KOReader while in a LANDSCAPE orientation,
     --       since they're only exposed inside the stock reader, and not the Home/KUAL Booklets.
     local haslipc, lipc = pcall(require, "liblipclua")
-    if haslipc and lipc then
+    if haslipc then
         local lipc_handle = lipc.init("com.github.koreader.screen")
         if lipc_handle then
             local orientation_code = lipc_handle:get_string_property(
@@ -1118,21 +1636,6 @@ function KindleOasis2:init()
             return this:handleGyroEv(ev)
         end
     end
-
-    self.input.open(self.touch_dev)
-    self.input.open("/dev/input/by-path/platform-gpio-keys-event")
-
-    -- Get accelerometer device by looking for EV=d
-    local std_out = io.popen("grep -e 'Handlers\\|EV=' /proc/bus/input/devices | grep -B1 'EV=d' | grep -o 'event[0-9]\\{1,2\\}'", "r")
-    if std_out then
-        local rotation_dev = std_out:read("*line")
-        std_out:close()
-        if rotation_dev then
-            self.input.open("/dev/input/"..rotation_dev)
-        end
-    end
-
-    self.input.open("fake_events")
 end
 
 function KindleOasis3:init()
@@ -1144,8 +1647,8 @@ function KindleOasis3:init()
     self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
     self.powerd = require("device/kindle/powerd"):new{
         device = self,
-        fl_intensity_file = "/sys/class/backlight/lm3697-bl1/brightness",
-        warmth_intensity_file = "/sys/class/backlight/lm3697-bl0/brightness",
+        fl_intensity_files = { "/sys/class/backlight/lm3697-bl1/brightness" },
+        warmth_intensity_files = { "/sys/class/backlight/lm3697-bl0/brightness" },
         batt_capacity_file = "/sys/class/power_supply/max77796-battery/capacity",
         is_charging_file = "/sys/class/power_supply/max77796-charger/charging",
         batt_status_file = "/sys/class/power_supply/max77796-charger/status",
@@ -1165,7 +1668,7 @@ function KindleOasis3:init()
 
     --- @note The same quirks as on the Oasis 2 apply ;).
     local haslipc, lipc = pcall(require, "liblipclua")
-    if haslipc and lipc then
+    if haslipc then
         local lipc_handle = lipc.init("com.github.koreader.screen")
         if lipc_handle then
             local orientation_code = lipc_handle:get_string_property(
@@ -1201,21 +1704,6 @@ function KindleOasis3:init()
             return this:handleGyroEv(ev)
         end
     end
-
-    self.input.open(self.touch_dev)
-    self.input.open("/dev/input/by-path/platform-gpio-keys-event")
-
-    -- Get accelerometer device by looking for EV=d
-    local std_out = io.popen("grep -e 'Handlers\\|EV=' /proc/bus/input/devices | grep -B1 'EV=d' | grep -o 'event[0-9]\\{1,2\\}'", "r")
-    if std_out then
-        local rotation_dev = std_out:read("*line")
-        std_out:close()
-        if rotation_dev then
-            self.input.open("/dev/input/"..rotation_dev)
-        end
-    end
-
-    self.input.open("fake_events")
 end
 
 function KindleBasic2:init()
@@ -1229,16 +1717,13 @@ function KindleBasic2:init()
     }
 
     Kindle.init(self)
-
-    self.input.open(self.touch_dev)
-    self.input.open("fake_events")
 end
 
 function KindlePaperWhite4:init()
     self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
     self.powerd = require("device/kindle/powerd"):new{
         device = self,
-        fl_intensity_file = "/sys/class/backlight/bl/brightness",
+        fl_intensity_files = { "/sys/class/backlight/bl/brightness" },
         batt_capacity_file = "/sys/class/power_supply/bd71827_bat/capacity",
         is_charging_file = "/sys/class/power_supply/bd71827_bat/charging",
         batt_status_file = "/sys/class/power_supply/bd71827_bat/status",
@@ -1246,26 +1731,13 @@ function KindlePaperWhite4:init()
     }
 
     Kindle.init(self)
-
-    -- So, look for a goodix TS input device (c.f., #5110)...
-    local std_out = io.popen("grep -e 'Handlers\\|Name=' /proc/bus/input/devices | grep -A1 'goodix-ts' | grep -o 'event[0-9]'", "r")
-    if std_out then
-        local goodix_dev = std_out:read("*line")
-        std_out:close()
-        if goodix_dev then
-            self.touch_dev = "/dev/input/" .. goodix_dev
-        end
-    end
-
-    self.input.open(self.touch_dev)
-    self.input.open("fake_events")
 end
 
 function KindleBasic3:init()
     self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
     self.powerd = require("device/kindle/powerd"):new{
         device = self,
-        fl_intensity_file = "/sys/class/backlight/bl/brightness",
+        fl_intensity_files = { "/sys/class/backlight/bl/brightness" },
         batt_capacity_file = "/sys/class/power_supply/bd71827_bat/capacity",
         is_charging_file = "/sys/class/power_supply/bd71827_bat/charging",
         batt_status_file = "/sys/class/power_supply/bd71827_bat/status",
@@ -1278,37 +1750,15 @@ function KindleBasic3:init()
     -- so we have to rely on contact lift detection via BTN_TOUCH:0,
     -- c.f., https://github.com/koreader/koreader/issues/5070
     self.input.snow_protocol = true
-    self.input.open(self.touch_dev)
-    self.input.open("fake_events")
-end
-
-local function findInputDevices()
-    -- Walk /sys/class/input and pick up any evdev input device with *any* EV_ABS capabilities
-    local devices = {}
-    for evdev in lfs.dir("/sys/class/input/") do
-        if evdev:match("event.*") then
-            local abs_cap = "/sys/class/input/" .. evdev .. "/device/capabilities/abs"
-            local f = io.open(abs_cap, "r")
-            if f then
-                local bitmap_str = f:read("l")
-                f:close()
-                if bitmap_str ~= "0" then
-                    logger.info("Potential input device found at", evdev, "because of ABS caps:", bitmap_str)
-                    table.insert(devices, "/dev/input/" .. evdev)
-                end
-            end
-        end
-    end
-
-    return devices
+    self.input.handleTouchEv = self.input.handleTouchEvSnow
 end
 
 function KindlePaperWhite5:init()
     self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
     self.powerd = require("device/kindle/powerd"):new{
         device = self,
-        fl_intensity_file = "/sys/class/backlight/fp9966-bl1/brightness",
-        warmth_intensity_file = "/sys/class/backlight/fp9966-bl0/brightness",
+        fl_intensity_files = { "/sys/class/backlight/fp9966-bl1/brightness" },
+        warmth_intensity_files = { "/sys/class/backlight/fp9966-bl0/brightness" },
         batt_capacity_file = "/sys/class/power_supply/bd71827_bat/capacity",
         is_charging_file = "/sys/class/power_supply/bd71827_bat/charging",
         batt_status_file = "/sys/class/power_supply/bd71827_bat/status",
@@ -1319,52 +1769,61 @@ function KindlePaperWhite5:init()
     self.screen:_MTK_ToggleFastMode(true)
 
     Kindle.init(self)
-
-    -- Some HW/FW variants stash their input device without a by-path symlink...
-    if util.pathExists("/dev/input/by-path/platform-1001e000.i2c-event") then
-        self.touch_dev = "/dev/input/by-path/platform-1001e000.i2c-event"
-        self.input.open(self.touch_dev)
-    else
-        local devices = findInputDevices()
-        for _, touch in ipairs(devices) do
-            -- There should only be one match on the PW5 anyway...
-            self.touch_dev = touch
-            self.input.open(touch)
-        end
-    end
-    self.input.open("fake_events")
 end
+KindlePaperWhite5SE.init = KindlePaperWhite5.init
 
-function KindleBasic4:init()
+function KindlePaperWhite6:init()
     self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
-    -- TBD, assume PW5 for now
     self.powerd = require("device/kindle/powerd"):new{
         device = self,
-        fl_intensity_file = "/sys/class/backlight/fp9966-bl1/brightness",
-        warmth_intensity_file = "/sys/class/backlight/fp9966-bl0/brightness",
+        fl_intensity_files = { "/sys/class/backlight/fp9967-bl1/brightness" },
+        warmth_intensity_files = { "/sys/class/backlight/fp9967-bl0/brightness" }, --- guess based on colorsoft
         batt_capacity_file = "/sys/class/power_supply/bd71827_bat/capacity",
         is_charging_file = "/sys/class/power_supply/bd71827_bat/charging",
         batt_status_file = "/sys/class/power_supply/bd71827_bat/status",
+        hall_file = "/sys/devices/platform/eink_hall/hall_enable",
     }
 
     -- Enable the so-called "fast" mode, so as to prevent the driver from silently promoting refreshes to REAGL.
     self.screen:_MTK_ToggleFastMode(true)
 
     Kindle.init(self)
+end
 
-    -- Some HW/FW variants stash their input device without a by-path symlink...
-    if util.pathExists("/dev/input/by-path/platform-1001e000.i2c-event") then
-        self.touch_dev = "/dev/input/by-path/platform-1001e000.i2c-event"
-        self.input.open(self.touch_dev)
-    else
-        local devices = findInputDevices()
-        for _, touch in ipairs(devices) do
-            -- There should only be one match on the PW5 anyway...
-            self.touch_dev = touch
-            self.input.open(touch)
-        end
-    end
-    self.input.open("fake_events")
+function KindleBasic4:init()
+    self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
+    self.powerd = require("device/kindle/powerd"):new{
+        device = self,
+        fl_intensity_files = { "/sys/class/backlight/fp9966-bl1/brightness" },
+        warmth_intensity_files = { "/sys/class/backlight/fp9966-bl0/brightness" },
+        batt_capacity_file = "/sys/class/power_supply/bd71827_bat/capacity",
+        is_charging_file = "/sys/class/power_supply/bd71827_bat/charging",
+        batt_status_file = "/sys/class/power_supply/bd71827_bat/status",
+        hall_file = "/sys/devices/platform/eink_hall/hall_enable",
+    }
+
+    -- Enable the so-called "fast" mode, so as to prevent the driver from silently promoting refreshes to REAGL.
+    self.screen:_MTK_ToggleFastMode(true)
+
+    Kindle.init(self)
+end
+
+function KindleBasic5:init()
+    self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
+    self.powerd = require("device/kindle/powerd"):new{
+        device = self,
+        fl_intensity_files = { "/sys/class/backlight/fp9967-bl1/brightness" },
+        warmth_intensity_files = { "/sys/class/backlight/fp9967-bl0/brightness" }, --- guess based on colorsoft
+        batt_capacity_file = "/sys/class/power_supply/bd71827_bat/capacity",
+        is_charging_file = "/sys/class/power_supply/bd71827_bat/charging",
+        batt_status_file = "/sys/class/power_supply/bd71827_bat/status",
+        hall_file = "/sys/devices/platform/eink_hall/hall_enable",
+    }
+
+    -- Enable the so-called "fast" mode, so as to prevent the driver from silently promoting refreshes to REAGL.
+    self.screen:_MTK_ToggleFastMode(true)
+
+    Kindle.init(self)
 end
 
 function KindleScribe:init()
@@ -1376,22 +1835,22 @@ function KindleScribe:init()
     self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
     self.powerd = require("device/kindle/powerd"):new{
         device = self,
-        fl_intensity_file = "/sys/class/backlight/fp9966-bl1/brightness",
-        warmth_intensity_file = "/sys/class/backlight/fp9966-bl0/brightness",
+        fl_intensity_files = { "/sys/class/backlight/fp9966-bl1/brightness" },
+        warmth_intensity_files = { "/sys/class/backlight/fp9966-bl0/brightness" },
         batt_capacity_file = "/sys/class/power_supply/bd71827_bat/capacity",
         is_charging_file = "/sys/class/power_supply/bd71827_bat/charging",
         batt_status_file = "/sys/class/power_supply/bd71827_bat/status",
         hall_file = "/sys/devices/platform/eink_hall/hall_enable",
     }
 
-    Kindle.init(self)
-
     -- Enable the so-called "fast" mode, so as to prevent the driver from silently promoting refreshes to REAGL.
     self.screen:_MTK_ToggleFastMode(true)
 
+    Kindle.init(self)
+
     --- @note The same quirks as on the Oasis 2 and 3 apply ;).
     local haslipc, lipc = pcall(require, "liblipclua")
-    if haslipc and lipc then
+    if haslipc then
         local lipc_handle = lipc.init("com.github.koreader.screen")
         if lipc_handle then
             local orientation_code = lipc_handle:get_string_property(
@@ -1399,14 +1858,10 @@ function KindleScribe:init()
             logger.dbg("orientation_code =", orientation_code)
             local rotation_mode = 0
             if orientation_code then
-                if orientation_code == "U" then
+                if orientation_code == "U" or orientation_code == "L" then
                     rotation_mode = self.screen.DEVICE_ROTATED_UPRIGHT
-                elseif orientation_code == "R" then
-                    rotation_mode = self.screen.DEVICE_ROTATED_CLOCKWISE
-                elseif orientation_code == "D" then
+                elseif orientation_code == "D" or orientation_code == "R" then
                     rotation_mode = self.screen.DEVICE_ROTATED_UPSIDE_DOWN
-                elseif orientation_code == "L" then
-                    rotation_mode = self.screen.DEVICE_ROTATED_COUNTER_CLOCKWISE
                 end
             end
             if rotation_mode > 0 then
@@ -1428,16 +1883,155 @@ function KindleScribe:init()
             return this:handleGyroEv(ev)
         end
     end
-    -- Get accelerometer device
-    self.input.open("/dev/input/by-path/platform-11007000.i2c-event-joystick")
-
-    self.input.open(self.touch_dev)
-    self.input.open("fake_events")
 
     -- Setup pen input
     self.input.wacom_protocol = true
-    self.input.open("/dev/input/event4")
 end
+
+function KindleScribe3:init()
+    -- temporarily wake up awesome
+    if os.getenv("AWESOME_STOPPED") == "yes" then
+        os.execute("killall -CONT awesome")
+    end
+
+    self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
+    self.powerd = require("device/kindle/powerd"):new{
+        device = self,
+        fl_intensity_files = { "/sys/class/backlight/fp9967-bl0/brightness", "/sys/class/backlight/fp9967-bl3/brightness", },
+        warmth_intensity_files = { "/sys/class/backlight/fp9967-bl1/brightness", "/sys/class/backlight/fp9967-bl2/brightness", },
+        batt_capacity_file = "/sys/class/power_supply/bd71827_bat/capacity",
+        is_charging_file = "/sys/class/power_supply/bd71827_bat/charging",
+        batt_status_file = "/sys/class/power_supply/bd71827_bat/status",
+        hall_file = "/sys/devices/platform/eink_hall/hall_enable",
+    }
+
+    -- Enable the so-called "fast" mode, so as to prevent the driver from silently promoting refreshes to REAGL.
+    self.screen:_MTK_ToggleFastMode(true)
+
+    Kindle.init(self)
+
+    --- @note The same quirks as on the Oasis 2 and 3 apply ;).
+    --- @note This is an assumption carried over from the KS(2) -HD
+    local haslipc, lipc = pcall(require, "liblipclua")
+    if haslipc then
+        local lipc_handle = lipc.init("com.github.koreader.screen")
+        if lipc_handle then
+            local orientation_code = lipc_handle:get_string_property(
+                "com.lab126.winmgr", "accelerometer")
+            logger.dbg("orientation_code =", orientation_code)
+            local rotation_mode = 0
+            if orientation_code then
+                if orientation_code == "U" or orientation_code == "L" then
+                    rotation_mode = self.screen.DEVICE_ROTATED_UPRIGHT
+                elseif orientation_code == "D" or orientation_code == "R" then
+                    rotation_mode = self.screen.DEVICE_ROTATED_UPSIDE_DOWN
+                end
+            end
+            if rotation_mode > 0 then
+                self.screen.native_rotation_mode = rotation_mode
+            end
+            self.screen:setRotationMode(rotation_mode)
+            lipc_handle:close()
+        end
+    end
+    -- put awesome back to sleep
+    if os.getenv("AWESOME_STOPPED") == "yes" then
+        os.execute("killall -STOP awesome")
+    end
+
+    -- Setup accelerometer rotation input
+    self.input:registerEventAdjustHook(KindleGyroTransform)
+    self.input.handleMiscEv = function(this, ev)
+        if ev.code == C.MSC_GYRO then
+            return this:handleGyroEv(ev)
+        end
+    end
+
+    -- Setup pen input
+    self.input.wacom_protocol = true
+end
+
+function KindleScribeColorSoft:init()
+    -- temporarily wake up awesome
+    if os.getenv("AWESOME_STOPPED") == "yes" then
+        os.execute("killall -CONT awesome")
+    end
+
+    self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
+    self.powerd = require("device/kindle/powerd"):new{
+        device = self,
+        fl_intensity_files = { "/sys/class/backlight/fp9967-bl0/brightness", "/sys/class/backlight/fp9967-bl3/brightness", },
+        warmth_intensity_files = { "/sys/class/backlight/fp9967-bl1/brightness", "/sys/class/backlight/fp9967-bl2/brightness", },
+        batt_capacity_file = "/sys/class/power_supply/bd71827_bat/capacity",
+        is_charging_file = "/sys/class/power_supply/bd71827_bat/charging",
+        batt_status_file = "/sys/class/power_supply/bd71827_bat/status",
+        hall_file = "/sys/devices/platform/eink_hall/hall_enable",
+    }
+
+    -- Enable the so-called "fast" mode, so as to prevent the driver from silently promoting refreshes to REAGL.
+    self.screen:_MTK_ToggleFastMode(true)
+
+    Kindle.init(self)
+
+    --- @note The same quirks as on the Oasis 2 and 3 apply ;).
+    --- @note This is an assumption carried over from the KS(2) -HD
+    local haslipc, lipc = pcall(require, "liblipclua")
+    if haslipc then
+        local lipc_handle = lipc.init("com.github.koreader.screen")
+        if lipc_handle then
+            local orientation_code = lipc_handle:get_string_property(
+                "com.lab126.winmgr", "accelerometer")
+            logger.dbg("orientation_code =", orientation_code)
+            local rotation_mode = 0
+            if orientation_code then
+                if orientation_code == "U" or orientation_code == "L" then
+                    rotation_mode = self.screen.DEVICE_ROTATED_UPRIGHT
+                elseif orientation_code == "D" or orientation_code == "R" then
+                    rotation_mode = self.screen.DEVICE_ROTATED_UPSIDE_DOWN
+                end
+            end
+            if rotation_mode > 0 then
+                self.screen.native_rotation_mode = rotation_mode
+            end
+            self.screen:setRotationMode(rotation_mode)
+            lipc_handle:close()
+        end
+    end
+    -- put awesome back to sleep
+    if os.getenv("AWESOME_STOPPED") == "yes" then
+        os.execute("killall -STOP awesome")
+    end
+
+    -- Setup accelerometer rotation input
+    self.input:registerEventAdjustHook(KindleGyroTransform)
+    self.input.handleMiscEv = function(this, ev)
+        if ev.code == C.MSC_GYRO then
+            return this:handleGyroEv(ev)
+        end
+    end
+
+    -- Setup pen input
+    self.input.wacom_protocol = true
+end
+
+function KindleColorSoft:init()
+    self.screen = require("ffi/framebuffer_mxcfb"):new{device = self, debug = logger.dbg}
+    self.powerd = require("device/kindle/powerd"):new{
+        device = self,
+        fl_intensity_files = { "/sys/class/backlight/fp9967-bl1/brightness" },
+        warmth_intensity_files = { "/sys/class/backlight/fp9967-bl0/brightness" },
+        batt_capacity_file = "/sys/class/power_supply/bd71827_bat/capacity",
+        is_charging_file = "/sys/class/power_supply/bd71827_bat/charging",
+        batt_status_file = "/sys/class/power_supply/bd71827_bat/status",
+        hall_file = "/sys/devices/platform/eink_hall/hall_enable",
+    }
+
+    -- Enable the so-called "fast" mode, so as to prevent the driver from silently promoting refreshes to REAGL.
+    self.screen:_MTK_ToggleFastMode(true)
+
+    Kindle.init(self)
+end
+
 
 function KindleTouch:exit()
     if self:isMTK() then
@@ -1446,6 +2040,9 @@ function KindleTouch:exit()
     end
 
     if self.framework_lipc_handle then
+        -- Fixes missing *stock Amazon UI* screensavers on exiting out of "no framework" started KOReader
+        -- module was unloaded in frameworkStopped() function but wasn't (re)loaded on KOReader exit
+        self.framework_lipc_handle:set_string_property("com.lab126.blanket", "load", "screensaver")
         self.framework_lipc_handle:close()
     end
 
@@ -1461,7 +2058,7 @@ function KindleTouch:exit()
         -- fake a touch event
         if self.touch_dev then
             local width, height = self.screen:getScreenWidth(), self.screen:getScreenHeight()
-            require("ffi/input").fakeTapInput(self.touch_dev,
+            require("libs/libkoreader-input").fakeTapInput(self.touch_dev,
                 math.min(width, height)/2,
                 math.max(width, height)-30
             )
@@ -1480,8 +2077,14 @@ KindlePaperWhite4.exit = KindleTouch.exit
 KindleBasic3.exit = KindleTouch.exit
 KindleOasis3.exit = KindleTouch.exit
 KindlePaperWhite5.exit = KindleTouch.exit
+KindlePaperWhite5SE.exit = KindleTouch.exit
+KindlePaperWhite6.exit = KindleTouch.exit
 KindleBasic4.exit = KindleTouch.exit
+KindleBasic5.exit = KindleTouch.exit
 KindleScribe.exit = KindleTouch.exit
+KindleScribe3.exit = KindleTouch.exit
+KindleColorSoft.exit = KindleTouch.exit
+KindleScribeColorSoft.exit = KindleTouch.exit
 
 function Kindle3:exit()
     -- send double menu key press events to trigger screen refresh
@@ -1535,9 +2138,16 @@ local pw4_set = Set { "0PP", "0T1", "0T2", "0T3", "0T4", "0T5", "0T6",
                   "16Q", "16R", "16S", "16T", "16U", "16V" }
 local kt4_set = Set { "10L", "0WF", "0WG", "0WH", "0WJ", "0VB" }
 local koa3_set = Set { "11L", "0WQ", "0WP", "0WN", "0WM", "0WL" }
-local pw5_set = Set { "1LG", "1Q0", "1PX", "1VD", "219", "21A", "2BH", "2BJ", "2DK" }
+local pw5_set = Set { "1Q0", "1PX", "1VD", "21A", "2BJ", "2DK" }
+local pw5se_set = Set { "1LG", "219", "2BH" }
 local kt5_set = Set { "22D", "25T", "23A", "2AQ", "2AP", "1XH", "22C" }
 local ks_set = Set { "27J", "2BL", "263", "227", "2BM", "23L", "23M", "270" }
+local kcs_set = Set { "3H2", "3H4", "3H6", "3H7", "3H9", "3JT", "3J6", "455", "456", "4EP", "34X", "3HB" }
+local kt6_set = Set { "A89", "3L2", "3L3", "3L4", "3L5", "3L6", "3KM" }
+local pw6_set = Set { "33W", "33X", "346", "349", "3H3", "3H5", "3H8", "3HA", "3J5", "3JS" } --- some of these are probably SE :/
+local ks2_set = Set { "3V0", "3V1", "3X5", "3UV", "3X4", "3X3", "41E", "410" }
+local ks3_set = Set { "4PG", "4PE", "4PL", "4F8", "4FA", "454" } --- may be a no frontlight model in here, need to see when the model releases
+local kscs_set = Set { "4VX", "4PF", "4PH", "4F9", "4FB", "46P" }
 
 if kindle_sn_lead == "B" or kindle_sn_lead == "9" then
     local kindle_devcode = string.sub(kindle_sn, 3, 4)
@@ -1582,10 +2192,24 @@ else
         return KindleOasis3
     elseif pw5_set[kindle_devcode_v2] then
         return KindlePaperWhite5
+    elseif pw5se_set[kindle_devcode_v2] then
+        return KindlePaperWhite5SE
     elseif kt5_set[kindle_devcode_v2] then
         return KindleBasic4
     elseif ks_set[kindle_devcode_v2] then
         return KindleScribe
+    elseif kcs_set[kindle_devcode_v2] then
+        return KindleColorSoft
+    elseif kt6_set[kindle_devcode_v2] then
+        return KindleBasic5
+    elseif pw6_set[kindle_devcode_v2] then
+        return KindlePaperWhite6
+    elseif ks2_set[kindle_devcode_v2] then
+        return KindleScribe -- Scribe 1 and 2 are identical.
+    elseif ks3_set[kindle_devcode_v2] then
+        return KindleScribe3
+    elseif kscs_set[kindle_devcode_v2] then
+        return KindleScribeColorSoft
     end
 end
 

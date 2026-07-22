@@ -9,7 +9,7 @@ local C_ = _.pgettext
 local T = require("ffi/util").template
 local Screen = Device.screen
 
--- This module exposes Scrolling settings, and additionnally
+-- This module exposes Scrolling settings, and additionally
 -- handles inertial scrolling on non-eInk devices.
 
 local SCROLL_METHOD_CLASSIC = "classic"
@@ -55,7 +55,7 @@ function ReaderScrolling:init()
     -- The different scrolling methods are handled directly by readerpaging/readerrolling
     self.scroll_method = G_reader_settings:readSetting("scroll_method")
 
-    -- Keep inertial scrolling available on the emulator (which advertizes itself as eInk)
+    -- Keep inertial scrolling available on the emulator (which advertises itself as eInk)
     if not Device:hasEinkScreen() or Device:isEmulator() then
         self._inertial_scroll_supported = true
     end
@@ -104,6 +104,7 @@ function ReaderScrolling:addToMainMenu(menu_items)
                 checked_func = function()
                     return self.scroll_method == self.SCROLL_METHOD_CLASSIC
                 end,
+                radio = true,
                 callback = function()
                     if self.scroll_method ~= self.SCROLL_METHOD_CLASSIC then
                         self.scroll_method = self.SCROLL_METHOD_CLASSIC
@@ -119,6 +120,7 @@ It allows for faster scrolling without the need to lift and reposition your fing
                 checked_func = function()
                     return self.scroll_method == self.SCROLL_METHOD_TURBO
                 end,
+                radio = true,
                 callback = function()
                     if self.scroll_method ~= self.SCROLL_METHOD_TURBO then
                         self.scroll_method = self.SCROLL_METHOD_TURBO
@@ -134,6 +136,7 @@ This is interesting on eInk if you only pan to better adjust page vertical posit
                 checked_func = function()
                     return self.scroll_method == self.SCROLL_METHOD_ON_RELEASE
                 end,
+                radio = true,
                 callback = function()
                     if self.scroll_method ~= self.SCROLL_METHOD_ON_RELEASE then
                         self.scroll_method = self.SCROLL_METHOD_ON_RELEASE

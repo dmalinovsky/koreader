@@ -2,7 +2,6 @@ local BD = require("ui/bidi")
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
-local DocSettings = require("docsettings")
 local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
@@ -11,7 +10,6 @@ local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local IconWidget = require("ui/widget/iconwidget")
 local ImageWidget = require("ui/widget/imagewidget")
-local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local LineWidget = require("ui/widget/linewidget")
@@ -21,11 +19,9 @@ local RightContainer = require("ui/widget/container/rightcontainer")
 local Size = require("ui/size")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
-local UIManager = require("ui/uimanager")
 local UnderlineContainer = require("ui/widget/container/underlinecontainer")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
-local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local filemanagerutil = require("apps/filemanager/filemanagerutil")
 local logger = require("logger")
 local util = require("util")
@@ -49,56 +45,11 @@ local corner_mark
 
 local scale_by_size = Screen:scaleBySize(1000000) * (1/1000000)
 
--- ItemShortCutIcon (for keyboard navigation) is private to menu.lua and can't be accessed,
--- so we need to redefine it
-local ItemShortCutIcon = WidgetContainer:extend{
-    dimen = Geom:new{ x = 0, y = 0, w = Screen:scaleBySize(22), h = Screen:scaleBySize(22) },
-    key = nil,
-    bordersize = Size.border.default,
-    radius = 0,
-    style = "square",
-}
-
-function ItemShortCutIcon:init()
-    if not self.key then
-        return
-    end
-    local radius = 0
-    local background = Blitbuffer.COLOR_WHITE
-    if self.style == "rounded_corner" then
-        radius = math.floor(self.width/2)
-    elseif self.style == "grey_square" then
-        background = Blitbuffer.COLOR_LIGHT_GRAY
-    end
-    local sc_face
-    if self.key:len() > 1 then
-        sc_face = Font:getFace("ffont", 14)
-    else
-        sc_face = Font:getFace("scfont", 22)
-    end
-    self[1] = FrameContainer:new{
-        padding = 0,
-        bordersize = self.bordersize,
-        radius = radius,
-        background = background,
-        dimen = self.dimen:copy(),
-        CenterContainer:new{
-            dimen = self.dimen,
-            TextWidget:new{
-                text = self.key,
-                face = sc_face,
-            },
-        },
-    }
-end
-
-
 -- Based on menu.lua's MenuItem
 local ListMenuItem = InputContainer:extend{
     entry = nil, -- hash, mandatory
     text = nil,
     show_parent = nil,
-    detail = nil,
     dimen = nil,
     shortcut = nil,
     shortcut_style = "square",
@@ -130,13 +81,8 @@ function ListMenuItem:init()
         }
         -- To keep a simpler widget structure, this shortcut icon will not
         -- be part of it, but will be painted over the widget in our paintTo
-        self.shortcut_icon = ItemShortCutIcon:new{
-            dimen = shortcut_icon_dimen,
-            key = self.shortcut,
-            style = self.shortcut_style,
-        }
+        self.shortcut_icon = self.menu:getItemShortCutIcon(shortcut_icon_dimen, self.shortcut, self.shortcut_style)
     end
-    self.detail = self.text
 
     -- we need this table per-instance, so we declare it here
     self.ges_events = {
@@ -154,13 +100,13 @@ function ListMenuItem:init()
         },
     }
 
-    -- We now build the minimal widget container that won't change after udpate()
+    -- We now build the minimal widget container that won't change after update()
 
     -- As done in MenuItem
     -- for compatibility with keyboard navigation
     -- (which does not seem to work well when multiple pages,
     -- even with classic menu)
-    self.underline_h = 1 -- smaller than default (3) to not shift our vertical aligment
+    self.underline_h = 1 -- smaller than default (3) to not shift our vertical alignment
     self._underline_container = UnderlineContainer:new{
         vertical_align = "top",
         padding = 0,
@@ -180,7 +126,7 @@ function ListMenuItem:init()
 end
 
 function ListMenuItem:update()
-    -- We will be a disctinctive widget whether we are a directory,
+    -- We will be a distinctive widget whether we are a directory,
     -- a known file with image / without image, or a not yet known file
     local widget
 
@@ -243,16 +189,16 @@ function ListMenuItem:update()
             height_overflow_show_ellipsis = true,
         }
         widget = OverlapGroup:new{
-            dimen = dimen,
+            dimen = dimen:copy(),
             LeftContainer:new{
-                dimen = dimen,
+                dimen = dimen:copy(),
                 HorizontalGroup:new{
                     HorizontalSpan:new{ width = pad_width },
                     wleft,
                 }
             },
             RightContainer:new{
-                dimen = dimen,
+                dimen = dimen:copy(),
                 HorizontalGroup:new{
                     wright,
                     HorizontalSpan:new{ width = pad_width },
@@ -286,6 +232,8 @@ function ListMenuItem:update()
             end
         end
 
+        local book_info = self.menu.getBookInfo(self.filepath)
+        self.been_opened = book_info.been_opened
         if bookinfo then -- This book is known
             self.bookinfo_found = true
             local cover_bb_used = false
@@ -345,7 +293,7 @@ function ListMenuItem:update()
                     }
                 end
             end
-            -- In case we got a blitbuffer and didnt use it (ignore_cover), free it
+            -- In case we got a blitbuffer and didn't use it (ignore_cover), free it
             if bookinfo.cover_bb and not cover_bb_used then
                 bookinfo.cover_bb:free()
             end
@@ -359,35 +307,24 @@ function ListMenuItem:update()
             --   file type
             --   pages read / nb of pages (not available for crengine doc not opened)
             -- Current page / pages are available or more accurate in .sdr/metadata.lua
-            -- We use a cache (cleaned at end of this browsing session) to store
-            -- page, percent read and book status from sidecar files, to avoid
-            -- re-parsing them when re-rendering a visited page
-            if not self.menu.cover_info_cache then
-                self.menu.cover_info_cache = {}
-            end
-            local pages_str = ""
-            local pages = bookinfo.pages -- default to those in bookinfo db
-            local percent_finished, status, has_highlight
-            if DocSettings:hasSidecarFile(self.filepath) then
-                self.been_opened = true
-                self.menu:updateCache(self.filepath, nil, true, pages) -- create new cache entry if absent
-                pages, percent_finished, status, has_highlight =
-                    unpack(self.menu.cover_info_cache[self.filepath], 1, self.menu.cover_info_cache[self.filepath].n)
-            end
+            local pages = book_info.pages or bookinfo.pages -- default to those in bookinfo db
+            local percent_finished = book_info.percent_finished
+            local status = book_info.status
             -- right widget, first line
             local directory, filename = util.splitFilePathName(self.filepath) -- luacheck: no unused
             local filename_without_suffix, filetype = filemanagerutil.splitFileNameType(filename)
             local fileinfo_str
             if bookinfo._no_provider then
-                -- for unspported files: don't show extension on the right,
+                -- for unsupported files: don't show extension on the right,
                 -- keep it in filename
                 filename_without_suffix = filename
                 fileinfo_str = self.mandatory
             else
-                local mark = has_highlight and "\u{2592}  " or "" -- "medium shade"
+                local mark = book_info.has_annotations and "\u{2592}  " or "" -- "medium shade"
                 fileinfo_str = mark .. BD.wrap(filetype) .. "  " .. BD.wrap(self.mandatory)
             end
             -- right widget, second line
+            local pages_str = ""
             if status == "complete" or status == "abandoned" then
                 -- Display these instead of the read %
                 if pages then
@@ -404,7 +341,7 @@ function ListMenuItem:update()
                     if BookInfoManager:getSetting("show_pages_read_as_progress") then
                         pages_str = T(_("Page %1 of %2"), Math.round(percent_finished*pages), pages)
                     else
-                        pages_str = T(_("%1 % of %2 pages"), math.floor(100*percent_finished), pages)
+                        pages_str = T(N_("%1 % of 1 page", "%1 % of %2 pages", pages), math.floor(100*percent_finished), pages)
                     end
                     if BookInfoManager:getSetting("show_pages_left_in_progress") then
                         pages_str = T(_("%1, %2 to read"), pages_str, Math.round(pages-percent_finished*pages), pages)
@@ -487,21 +424,20 @@ function ListMenuItem:update()
             local fontsize_title = _fontSize(20, 24)
             local fontsize_authors = _fontSize(18, 22)
             local wtitle, wauthors
-            local title, authors
+            local title, authors, reduce_font_size
+            local fixed_font_size = BookInfoManager:getSetting("fixed_item_font_size")
             local series_mode = BookInfoManager:getSetting("series_mode")
 
             -- whether to use or not title and authors
             -- (We wrap each metadata text with BD.auto() to get for each of them
             -- the text direction from the first strong character - which should
-            -- individually be the best thing, and additionnaly prevent shuffling
+            -- individually be the best thing, and additionally prevent shuffling
             -- if concatenated.)
             if self.do_filename_only or bookinfo.ignore_meta then
                 title = filename_without_suffix -- made out above
-                title = BD.auto(title)
                 authors = nil
             else
-                title = bookinfo.title and bookinfo.title or filename_without_suffix
-                title = BD.auto(title)
+                title = bookinfo.title or filename_without_suffix
                 authors = bookinfo.authors
                 -- If multiple authors (crengine separates them with \n), we
                 -- can display them on multiple lines, but limit to 2, and
@@ -518,40 +454,34 @@ function ListMenuItem:update()
                     end
                     authors = table.concat(authors, "\n")
                     -- as we'll fit 3 lines instead of 2, we can avoid some loops by starting from a lower font size
-                    fontsize_title = _fontSize(17, 21)
-                    fontsize_authors = _fontSize(15, 19)
+                    reduce_font_size = true
                 elseif authors then
                     authors = BD.auto(authors)
                 end
             end
+            title = BD.auto(title)
             -- add Series metadata if requested
-            if bookinfo.series then
-                if bookinfo.series_index then
-                    bookinfo.series = BD.auto(bookinfo.series .. " #" .. bookinfo.series_index)
-                else
-                    bookinfo.series = BD.auto(bookinfo.series)
-                end
+            if series_mode and bookinfo.series then
+                local series = bookinfo.series_index and bookinfo.series .. " #" .. bookinfo.series_index
+                    or bookinfo.series
+                series = BD.auto(series)
                 if series_mode == "append_series_to_title" then
-                    if title then
-                        title = title .. " - " .. bookinfo.series
-                    else
-                        title = bookinfo.series
-                    end
-                end
-                if not authors then
-                    if series_mode == "append_series_to_authors" or series_mode == "series_in_separate_line" then
-                        authors = bookinfo.series
-                    end
-                else
-                    if series_mode == "append_series_to_authors" then
-                        authors = authors .. " - " .. bookinfo.series
-                    elseif series_mode == "series_in_separate_line" then
-                        authors = bookinfo.series .. "\n" .. authors
+                    title = title .. " - " .. series
+                elseif series_mode == "append_series_to_authors" then
+                    authors = authors and authors .. " - " .. series or series
+                else -- "series_in_separate_line"
+                    if authors then
+                        authors = series .. "\n" .. authors
                         -- as we'll fit 3 lines instead of 2, we can avoid some loops by starting from a lower font size
-                        fontsize_title = _fontSize(17, 21)
-                        fontsize_authors = _fontSize(15, 19)
+                        reduce_font_size = true
+                    else
+                        authors = series
                     end
                 end
+            end
+            if reduce_font_size and not fixed_font_size then
+                fontsize_title = _fontSize(17, 21)
+                fontsize_authors = _fontSize(15, 19)
             end
             if bookinfo.unsupported then
                 -- Let's show this fact in place of the anyway empty authors slot
@@ -610,7 +540,7 @@ function ListMenuItem:update()
                     break
                 end
                 -- Don't go too low, and get out of this loop.
-                if fontsize_title <= 12 or fontsize_authors <= 10 then
+                if fixed_font_size or fontsize_title <= 12 or fontsize_authors <= 10 then
                     local title_height = wtitle:getSize().h
                     local title_line_height = wtitle:getLineHeight()
                     local title_min_height = 2 * title_line_height -- unscaled_size_check: ignore
@@ -643,7 +573,7 @@ function ListMenuItem:update()
             end
 
             local wmain = LeftContainer:new{
-                dimen = dimen,
+                dimen = dimen:copy(),
                 VerticalGroup:new{
                     wtitle,
                     wauthors,
@@ -652,7 +582,7 @@ function ListMenuItem:update()
 
             -- Build the final widget
             widget = OverlapGroup:new{
-                dimen = dimen,
+                dimen = dimen:copy(),
             }
             if self.do_cover_image then
                 -- add left widget
@@ -677,13 +607,13 @@ function ListMenuItem:update()
             end
             -- add padded main widget
             table.insert(widget, LeftContainer:new{
-                    dimen = dimen,
+                    dimen = dimen:copy(),
                     wmain
                 })
             -- add right widget
             if wright then
                 table.insert(widget, RightContainer:new{
-                    dimen = dimen,
+                    dimen = dimen:copy(),
                     HorizontalGroup:new{
                         wright,
                         HorizontalSpan:new{ width = wright_right_padding },
@@ -704,10 +634,6 @@ function ListMenuItem:update()
                 -- Not in db, we're going to fetch some cover
                 self.cover_specs = cover_specs
             end
-            --
-            if self.do_hint_opened and DocSettings:hasSidecarFile(self.filepath) then
-                self.been_opened = true
-            end
             -- No right widget by default, except in History
             local wright
             local wright_width = 0
@@ -723,7 +649,7 @@ function ListMenuItem:update()
                     face = Font:getFace("cfont", fontsize_info),
                     fgcolor = fgcolor,
                 }
-                local wpageinfo = TextWidget:new{ -- Empty but needed for similar positionning
+                local wpageinfo = TextWidget:new{ -- Empty but needed for similar positioning
                     text = "",
                     face = Font:getFace("cfont", fontsize_info),
                 }
@@ -762,7 +688,7 @@ function ListMenuItem:update()
                 fontsize_no_bookinfo = fontsize_no_bookinfo - fontsize_dec_step
             until text_widget:getSize().h <= dimen.h
             widget = LeftContainer:new{
-                dimen = dimen,
+                dimen = dimen:copy(),
                 HorizontalGroup:new{
                     HorizontalSpan:new{ width = Screen:scaleBySize(10) },
                     text_widget
@@ -770,10 +696,10 @@ function ListMenuItem:update()
             }
             if wright then -- last read date, in History, even for deleted files
                 widget = OverlapGroup:new{
-                    dimen = dimen,
+                    dimen = dimen:copy(),
                     widget,
                     RightContainer:new{
-                        dimen = dimen,
+                        dimen = dimen:copy(),
                         HorizontalGroup:new{
                             wright,
                             HorizontalSpan:new{ width = wright_right_padding },
@@ -815,11 +741,11 @@ function ListMenuItem:paintTo(bb, x, y)
         local target = self[1][1][2]
         local ix
         if BD.mirroredUILayout() then
-            ix = target.dimen.w - self.shortcut_icon.dimen.w
+            ix = target.dimen.w - self.shortcut_icon.dimen.w - 2 * self.shortcut_icon.bordersize
         else
             ix = 0
         end
-        local iy = target.dimen.h - self.shortcut_icon.dimen.h
+        local iy = target.dimen.h - self.shortcut_icon.dimen.h - self.shortcut_icon.bordersize
         self.shortcut_icon:paintTo(bb, x+ix, y+iy)
     end
 
@@ -875,11 +801,6 @@ function ListMenuItem:onUnfocus()
     return true
 end
 
-function ListMenuItem:onShowItemDetail()
-    UIManager:show(InfoMessage:new{ text = self.detail, })
-    return true
-end
-
 -- The transient color inversions done in MenuItem:onTapSelect
 -- and MenuItem:onHoldSelect are ugly when done on an image,
 -- so let's not do it
@@ -908,7 +829,6 @@ function ListMenu:_recalculateDimen()
             self.others_height = self.others_height + 2
         end
         if not self.no_title then
-            self.others_height = self.others_height + self.header_padding
             self.others_height = self.others_height + self.title_bar.dimen.h
         end
         if self.page_info then
@@ -991,20 +911,20 @@ function ListMenu:_updateItemsBuildUI()
     }
     table.insert(self.item_group, line_widget)
     local idx_offset = (self.page - 1) * self.perpage
+    local select_number
     for idx = 1, self.perpage do
-        local entry = self.item_table[idx_offset + idx]
+        local index = idx_offset + idx
+        local entry = self.item_table[index]
         if entry == nil then break end
-
+        entry.idx = index
+        if index == self.itemnumber then -- focused item
+            select_number = idx
+        end
         -- Keyboard shortcuts, as done in Menu
-        local item_shortcut = nil
-        local shortcut_style = "square"
+        local item_shortcut, shortcut_style
         if self.is_enable_shortcut then
-            -- give different shortcut_style to keys in different
-            -- lines of keyboard
-            if idx >= 11 and idx <= 20 then
-                shortcut_style = "grey_square"
-            end
             item_shortcut = self.item_shortcuts[idx]
+            shortcut_style = (idx < 11 or idx > 20) and "square" or "grey_square"
         end
 
         local item_tmp = ListMenuItem:new{
@@ -1034,6 +954,7 @@ function ListMenu:_updateItemsBuildUI()
         end
 
     end
+    return select_number
 end
 
 return ListMenu

@@ -1,9 +1,7 @@
 local Device = require("device")
 local Event = require("ui/event")
-local FileManager = require("apps/filemanager/filemanager")
 local UIManager = require("ui/uimanager")
 local _ = require("gettext")
-local C_ = _.pgettext
 local Screen = Device.screen
 
 local function genMenuItem(text, mode)
@@ -15,6 +13,7 @@ local function genMenuItem(text, mode)
             return Screen:getRotationMode() == mode
         end,
         radio = true,
+        check_callback_closes_menu = true,
         callback = function(touchmenu_instance)
             UIManager:broadcastEvent(Event:new("SetRotationMode", mode))
             touchmenu_instance:closeMenu()
@@ -57,8 +56,7 @@ If you need to do so, you'll have to use the UI toggles.]]),
                     return G_reader_settings:isTrue("input_lock_gsensor")
                 end,
                 callback = function()
-                    G_reader_settings:flipNilOrFalse("input_lock_gsensor")
-                    Device:lockGSensor(G_reader_settings:isTrue("input_lock_gsensor"))
+                    UIManager:broadcastEvent(Event:new("LockGSensor"))
                 end,
             })
         end
@@ -78,11 +76,9 @@ When unchecked, the default rotation of the file browser and the default/saved r
             separator = true,
         })
 
-        if FileManager.instance then
-            table.insert(rotation_table, genMenuItem(C_("Rotation", "⤹ 90°"), Screen.DEVICE_ROTATED_COUNTER_CLOCKWISE))
-            table.insert(rotation_table, genMenuItem(C_("Rotation", "↑ 0°"), Screen.DEVICE_ROTATED_UPRIGHT))
-            table.insert(rotation_table, genMenuItem(C_("Rotation", "⤸ 90°"), Screen.DEVICE_ROTATED_CLOCKWISE))
-            table.insert(rotation_table, genMenuItem(C_("Rotation", "↓ 180°"), Screen.DEVICE_ROTATED_UPSIDE_DOWN))
+        local optionsutil = require("ui/data/optionsutil")
+        for i, mode in ipairs(optionsutil.rotation_modes) do
+            table.insert(rotation_table, genMenuItem(optionsutil.rotation_labels[i], mode))
         end
 
         rotation_table[#rotation_table].separator = true

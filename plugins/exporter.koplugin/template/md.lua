@@ -1,4 +1,5 @@
 local _ = require("gettext")
+local T = require("ffi/util").template
 
 local formatters = {
     none = {
@@ -35,33 +36,35 @@ local formatters = {
     },
 }
 
-local function prepareBookContent(book, formatting_options, highlight_formatting)
-    local content = ""
+local function prepareBookContent(book, formatting_options, highlight_formatting, export_backlinks)
+    local tbl = {}
     local current_chapter = nil
-    content = content .. "# " .. book.title .. "\n"
+    table.insert(tbl, "# " .. book.title)
     local author = book.author or _("N/A")
-    content = content .. "##### " .. author:gsub("\n", ", ") .. "\n\n"
-    for _, note in ipairs(book) do
+    table.insert(tbl, "##### " .. author:gsub("\n", ", ") .. "\n")
+    for __, note in ipairs(book) do
         local entry = note[1]
         if entry.chapter ~= current_chapter then
             current_chapter = entry.chapter
-            content = content .. "## " .. current_chapter .. "\n"
+            table.insert(tbl, "## " .. current_chapter)
         end
-        content = content .. "### Page " .. entry.page .. " @ " .. os.date("%d %B %Y %I:%M:%S %p", entry.time) .. "\n"
+        table.insert(tbl, "### Page " .. entry.page .. " @ " .. os.date("%d %B %Y %I:%M:%S %p", entry.time))
         if highlight_formatting then
-            content = content .. string.format(formatters[formatting_options[entry.drawer]].formatter, entry.text) .."\n"
+            table.insert(tbl, string.format(formatters[formatting_options[entry.drawer]].formatter, entry.text))
         else
-            content = content .. entry.text .. "\n"
+            table.insert(tbl, entry.text)
         end
         if entry.note then
-            content = content .. "\n---\n" .. entry.note .. "\n"
+            table.insert(tbl, "\n---\n" .. entry.note)
         end
-        content = content .. "\n"
+        if export_backlinks then
+            table.insert(tbl, "\n" .. T("[%1](<file://%2?pos=%3>)", _("View in book"), book.file, entry.pn_xp))
+        end
     end
-    return content
+    return tbl
 end
 
 return {
     prepareBookContent = prepareBookContent,
-    formatters = formatters
+    formatters = formatters,
 }

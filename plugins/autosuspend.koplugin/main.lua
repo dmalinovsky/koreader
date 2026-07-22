@@ -21,7 +21,7 @@ local default_autoshutdown_timeout_seconds = 3*24*60*60 -- three days
 local default_auto_suspend_timeout_seconds = 15*60 -- 15 minutes
 local default_auto_standby_timeout_seconds = 4 -- 4 seconds; should be safe on Kobo/Sage
 local default_standby_timeout_after_resume_seconds = 4 -- 4 seconds; should be safe on Kobo/Sage, not customizable
-local default_kindle_t1_timeout_reset_seconds = 5*60 -- 5 minutes (i.e., half of the standard t1 timeout).
+local default_kindle_t1_timeout_reset_seconds = 4*60 -- 4 minutes (i.e., lower than the minimum t1 timeout).
 
 local AutoSuspend = WidgetContainer:extend{
     name = "autosuspend",
@@ -130,13 +130,28 @@ if Device:isKindle() then
             return
         end
 
-        -- NOTE: Unlike us, powerd doesn't care about charging, so we always use the delta since the last user input.
-        local now = UIManager:getElapsedTimeSinceBoot()
-        local kindle_t1_reset_seconds = default_kindle_t1_timeout_reset_seconds - time.to_number(now - self.last_action_time)
+        -- KeepAlive on Kindles work by disabling screensaver in powerd. As this makes the t1 timeout behave wackily,
+        -- we must not reset it, as it causes a crash.
+        if PluginShare.keepalive then
+            logger.dbg("AutoSuspend: KeepAlive is active, skipping t1 timeout reset")
+            return
+        end
 
-        if self:_enabled() and kindle_t1_reset_seconds <= 0 then
+        -- Also causes problems when charging.
+        if PowerD:isCharging() and not PowerD:isCharged() then
+            logger.dbg("AutoSuspend: Device is charging, skipping t1 timeout reset")
+            return
+        end
+
+        local now = UIManager:getElapsedTimeSinceBoot()
+        local kindle_t1_reset_seconds = default_kindle_t1_timeout_reset_seconds - time.to_number(now - self.last_t1_reset_time)
+        -- NOTE: Unlike us, powerd doesn't care about charging, so we always use the delta since the last user input.
+        local suspend_delay_seconds = self.auto_suspend_timeout_seconds - time.to_number(now - self.last_action_time)
+
+        if self:_enabled() and suspend_delay_seconds > 0 and kindle_t1_reset_seconds <= 0 then
             logger.dbg("AutoSuspend: will reset the system's t1 timeout, re-scheduling check")
             PowerD:resetT1Timeout()
+            self.last_t1_reset_time = UIManager:getElapsedTimeSinceBoot()
             -- Re-schedule ourselves, as, unlike suspend/shutdown/standby, we don't have a specific Event to handle that for us.
             UIManager:scheduleIn(default_kindle_t1_timeout_reset_seconds, self.kindle_task)
         else
@@ -192,6 +207,7 @@ function AutoSuspend:init()
         self:_schedule(shutdown_only)
     end
     if Device:isKindle() then
+        self.last_t1_reset_time = 0
         self.kindle_task = function()
             self:_schedule_kindle()
         end
@@ -408,11 +424,12 @@ function AutoSuspend:pickTimeoutValue(touchmenu_instance, title, info, setting,
     local is_standby = setting == "auto_standby_timeout_seconds"
 
     local day, hour, minute, second
-    local day_max, hour_max, min_max, sec_max
+    local day_max, day_min, hour_max, min_max, sec_max
     if time_scale == 2 then
         day = math.floor(setting_val * (1/(24*3600)))
         hour = math.floor(setting_val * (1/3600)) % 24
         day_max = math.floor(range[2] * (1/(24*3600))) - 1
+        day_min = 0
         hour_max = 23
     elseif time_scale == 1 then
         hour = math.floor(setting_val * (1/3600))
@@ -437,6 +454,7 @@ function AutoSuspend:pickTimeoutValue(touchmenu_instance, title, info, setting,
         min_hold_step = 10,
         sec_hold_step = 10,
         day_max = day_max,
+        day_min = day_min,
         hour_max = hour_max,
         min_max = min_max,
         sec_max = sec_max,
@@ -465,6 +483,7 @@ function AutoSuspend:pickTimeoutValue(touchmenu_instance, title, info, setting,
                 text = T(_("%1: %2"), title, time_string),
                 timeout = 3,
             })
+            time_spinner:onClose()
         end,
         default_value = datetime.secondsToClockDuration("letters", default_value,
             time_scale == 2 or time_scale == 1, true),
@@ -549,7 +568,7 @@ function AutoSuspend:addToMainMenu(menu_items)
             keep_menu_open = true,
             callback = function(touchmenu_instance)
                 -- 5*60 sec (5') is the minimum and 28*24*3600 (28days) is the maximum shutdown time.
-                -- Minimum time has to be big enough, to avoid start-stop death scenarious.
+                -- Minimum time has to be big enough, to avoid start-stop death scenarios.
                 -- Maximum more than four weeks seems a bit excessive if you want to enable authoshutdown,
                 -- even if the battery can last up to three months.
                 self:pickTimeoutValue(touchmenu_instance,

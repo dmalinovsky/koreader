@@ -24,8 +24,9 @@ local T = require("ffi/util").template
 -- Default globally enabled style tweaks, for new installations
 local DEFAULT_GLOBAL_STYLE_TWEAKS = {}
 -- Display in-page per-specs footnotes for EPUB and FB2:
-DEFAULT_GLOBAL_STYLE_TWEAKS["footnote-inpage_epub_smaller"] = true
+DEFAULT_GLOBAL_STYLE_TWEAKS["footnote-inpage_epub"] = true
 DEFAULT_GLOBAL_STYLE_TWEAKS["footnote-inpage_fb2"] = true
+DEFAULT_GLOBAL_STYLE_TWEAKS["inpage_footnote_font-size_smaller"] = true
 
 local CssTweaks = {
     DEFAULT_GLOBAL_STYLE_TWEAKS = DEFAULT_GLOBAL_STYLE_TWEAKS,
@@ -189,7 +190,7 @@ These tweaks allow you to change this behavior, and to override publisher rules.
                 separator = true,
             },
             -- To avoid duplicating these 2 tweaks into 2 others for ignoring publisher rules,
-            -- we apply the rules to BODY without !important (so they can still be overriden
+            -- we apply the rules to BODY without !important (so they can still be overridden
             -- by publisher rules applied to BODY), and to DocFragment with !important (so
             -- that with "* {widows/orphans: inherit !important}", all elements will inherit
             -- from the DocFragment rules.
@@ -430,7 +431,11 @@ Further small adjustments can be done with 'Line Spacing' in the bottom menu.]])
                 id = "font_family_all_inherit",
                 title = _("Ignore publisher font families"),
                 description = _("Disable font-family specified in embedded styles."),
-                css = [[* { font-family: inherit !important; }]],
+                -- but we better keep the classic monospace ones be monospace
+                css = [[
+* { font-family: inherit !important; }
+listing, plaintext, xmp, samp, tt, kbd, pre, code { font-family: monospace !important; }
+                ]],
                 separator = true,
             },
             {
@@ -478,6 +483,26 @@ sup { font-size: 50% !important; vertical-align: super !important; }
 sub { font-size: 50% !important; vertical-align: sub !important; }
                 ]],
             },
+            (function()
+                local sub_table = {
+                    title = _("Override font-based normal line height"),
+                }
+                for __, height in ipairs( { 0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45, 1.5 } ) do
+                    table.insert(sub_table, {
+                        id = T("normal_line-height_%1", height * 100),
+                        conflicts_with = function(id) return util.stringStartsWith(id, "normal_line-height_") end,
+                        title = T(_("Normal line height: %1"), height),
+                        css = T([[
+* {
+    -cr-hint: late;
+    -cr-only-if: line-height-normal;
+        line-height: %1 !important;
+}
+                        ]], height),
+                    })
+                end
+                return sub_table
+            end)(),
         },
     },
     {
@@ -574,7 +599,7 @@ body, h1, h2, h3, h4, h5, h6, div, li, td, th { text-indent: 0 !important; }
             {
                 id = "table_no_presentational_hints",
                 title = _("Ignore tables related HTML presentational hints"),
-                description = _("Ignore HTML attributes that contribute to styles on the <table> element and its sub-elements (ie. align, valign, frame, rules, border, cellpading, cellspacing…)."),
+                description = _("Ignore HTML attributes that contribute to styles on the <table> element and its sub-elements (ie. align, valign, frame, rules, border, cellpadding, cellspacing…)."),
                 css = [[table, caption, colgroup, col, thead, tbody, tfoot, tr, td, th { -cr-hint: no-presentational; }]],
                 separator = true,
             },
@@ -684,7 +709,7 @@ table, tcaption, tr, th, td { border: black solid 1px; border-collapse: collapse
                 title = _("Full-width images"),
                 description = _("Useful for books containing only images, when they are smaller than your screen. May stretch images in some cases."),
                 -- This helped me once with a book. Will mess with aspect ratio
-                -- when images have a style="width: NNpx; heigh: NNpx"
+                -- when images have a style="width: NNpx; height: NNpx"
                 css = [[
 img {
 text-align: center !important;
@@ -783,13 +808,29 @@ This is just an example, that will need to be adapted into a user style tweak.]]
             },
         },
         {
-            id = "no_pseudo_element_before_after",
-            title = _("Disable before/after pseudo elements"),
-            description = _([[Disable generated text from ::before and ::after pseudo elements, usually used to add cosmetic text around some content.]]),
-            css = [[
+            title = _("Pseudo-elements"),
+            {
+                id = "no_pseudo_element_before_after",
+                title = _("Disable before/after pseudo elements"),
+                description = _([[Disable generated text from ::before and ::after pseudo elements, usually used to add cosmetic text around some content.]]),
+                css = [[
 *::before { display: none !important; }
 *::after  { display: none !important; }
-            ]],
+                ]],
+            },
+            {
+                id = "no_pseudo_element_first_letter",
+                title = _("Disable first-letter pseudo elements"),
+                description = _([[Disable first letter styling from ::first-letter pseudo elements.]]),
+                css = [[*::first-letter { display: none !important; }]],
+            },
+            {
+                id = "no_pseudo_element_first_line",
+                title = _("Disable first-line pseudo elements"),
+                description = _([[Disable first line styling from ::first-line pseudo elements.]]),
+                css = [[*::first-line { display: none !important; }]],
+                separator = true,
+            },
             separator = true,
         },
         {
@@ -878,7 +919,7 @@ body[name="comments"] > section
         {
             id = "footnote-inpage_epub",
             conflicts_with = function(id) return util.stringStartsWith(id, "footnote-inpage_") end,
-            global_conflicts_with = function(id) return util.stringStartsWith(id, "footnote-inpage_epub") end,
+            global_conflicts_with = false,
             title = _("In-page EPUB footnotes"),
             description = _([[
 Show EPUB footnote text at the bottom of pages that contain links to them.
@@ -901,37 +942,9 @@ This only works with footnotes that have specific attributes set by the publishe
             ]],
         },
         {
-            id = "footnote-inpage_epub_smaller",
-            conflicts_with = function(id) return util.stringStartsWith(id, "footnote-inpage_") end,
-            global_conflicts_with = function(id) return util.stringStartsWith(id, "footnote-inpage_epub") end,
-            title = _("In-page EPUB footnotes (smaller)"),
-            description = _([[
-Show EPUB footnote text at the bottom of pages that contain links to them.
-This only works with footnotes that have specific attributes set by the publisher.]]),
-            -- Restrict this to non-FB2 documents, as FB2 can have <a type="note">
-            -- and we don't want to have them smaller
-            css = [[
-*[type~="note"],
-*[type~="endnote"],
-*[type~="footnote"],
-*[type~="rearnote"],
-*[role~="doc-note"],
-*[role~="doc-endnote"],
-*[role~="doc-footnote"],
-*[role~="doc-rearnote"]
-{
-    -cr-only-if: -fb2-document;
-        -cr-hint: footnote-inpage;
-        margin: 0 !important;
-        font-size: 0.8rem !important;
-}
-            ]],
-            separator = true,
-        },
-        {
             id = "footnote-inpage_wikipedia",
             conflicts_with = function(id) return util.stringStartsWith(id, "footnote-inpage_") end,
-            global_conflicts_with = function(id) return util.stringStartsWith(id, "footnote-inpage_wikipedia") end,
+            global_conflicts_with = false,
             title = _("In-page Wikipedia footnotes"),
             description = _([[Show footnotes at the bottom of pages in Wikipedia EPUBs.]]),
             css = [[
@@ -945,38 +958,20 @@ ol.references > li > .noprint { display: none; }
 ol.references > li > .mw-cite-backlink { display: none; }
             ]],
         },
-        {
-            id = "footnote-inpage_wikipedia_smaller",
-            conflicts_with = function(id) return util.stringStartsWith(id, "footnote-inpage_") end,
-            global_conflicts_with = function(id) return util.stringStartsWith(id, "footnote-inpage_wikipedia") end,
-            title = _("In-page Wikipedia footnotes (smaller)"),
-            description = _([[Show footnotes at the bottom of pages in Wikipedia EPUBs.]]),
-            css = [[
-ol.references > li {
-    -cr-hint: footnote-inpage;
-    list-style-position: -cr-outside;
-    margin: 0 !important;
-    font-size: 0.8rem !important;
-}
-/* hide backlinks */
-ol.references > li > .noprint { display: none; }
-ol.references > li > .mw-cite-backlink { display: none; }
-            ]],
-            separator = true,
-        },
-        -- We can add other classic classnames to the 2 following
-        -- tweaks (except when named 'calibreN', as the N number is
+        -- We can add other classic classnames to the following
+        -- tweak (except when named 'calibreN', as the N number is
         -- usually random across books).
         {
             id = "footnote-inpage_classic_classnames",
             conflicts_with = function(id) return util.stringStartsWith(id, "footnote-inpage_") end,
-            global_conflicts_with = function(id) return util.stringStartsWith(id, "footnote-inpage_classic_classnames") end,
+            global_conflicts_with = false,
             title = _("In-page classic classname footnotes"),
             description = _([[
 Show footnotes with classic classnames at the bottom of pages.
 This tweak can be duplicated as a user style tweak when books contain footnotes wrapped with other class names.]]),
             css = [[
-.footnote, .footnotes, .fn,
+.footnote, .footnote1,
+.footnotes, .fn,
 .note, .note1, .note2, .note3,
 .ntb, .ntb-txt, .ntb-txt-j,
 .fnote, .fnote1,
@@ -988,28 +983,49 @@ This tweak can be duplicated as a user style tweak when books contain footnotes 
     margin: 0 !important;
 }
             ]],
+            separator = true,
         },
         {
-            id = "footnote-inpage_classic_classnames_smaller",
-            conflicts_with = function(id) return util.stringStartsWith(id, "footnote-inpage_") end,
-            global_conflicts_with = function(id) return util.stringStartsWith(id, "footnote-inpage_classic_classnames") end,
-            title = _("In-page classic classname footnotes (smaller)"),
-            description = _([[
-Show footnotes with classic classnames at the bottom of pages.
-This tweak can be duplicated as a user style tweak when books contain footnotes wrapped with other class names.]]),
-            css = [[
-.footnote, .footnotes, .fn,
-.note, .note1, .note2, .note3,
-.ntb, .ntb-txt, .ntb-txt-j,
-.przypis, .przypis1, /* Polish footnotes */
-.voetnoten /* Dutch footnotes */
-{
-    -cr-hint: footnote-inpage;
-    margin: 0 !important;
-    font-size: 0.8rem !important;
+            title = _("In-page footnote extension"),
+            {
+                id = "extend-footnote-inpage_any",
+                conflicts_with = function(id) return util.stringStartsWith(id, "extend-footnote-inpage_") end,
+                title = _("Extend footnote content until next entry"),
+                description = _([[
+Extend in-page footnotes shown at the bottom of pages to include text up to the next footnote.
+This might be needed when books don't correctly mark all text that belongs to the footnote.]]),
+-- :where() and priority are needed to ensure lower specificity than
+-- any other tweaks that check -cr-only-if: (inside-)inpage-footnote
+                priority = -1,
+                css = [[
+:where(*, autoBoxing) {
+    -cr-hint: late;
+    -cr-only-if: following-inpage-footnote -inpage-footnote;
+        -cr-hint: extend-footnote-inpage;
+        margin: 0 !important;
 }
-            ]],
-            separator = true,
+                ]],
+            },
+            {
+                id = "extend-footnote-inpage_until_heading",
+                conflicts_with = function(id) return util.stringStartsWith(id, "extend-footnote-inpage_") end,
+                title = _("Extend footnote content until next header"),
+                description = _([[
+Extend in-page footnotes shown at the bottom of pages to include text up to the next footnote or heading.
+This might be needed when books don't correctly mark all text that belongs to the footnote.
+This tweak can be duplicated as a user style tweak when a book contains other elements between footnotes that should not be shown in-page.]]),
+-- :where() and priority are needed to ensure lower specificity than
+-- any other tweaks that check -cr-only-if: (inside-)inpage-footnote
+                priority = -1,
+                css = [[
+:where(*:not(h1, h2, h3, h4, h5, h6), autoBoxing) {
+    -cr-hint: late;
+    -cr-only-if: following-inpage-footnote -inpage-footnote;
+        -cr-hint: extend-footnote-inpage;
+        margin: 0 !important;
+}
+                ]],
+            },
         },
         -- Next tweaks, with the help of crengine, will apply only to elements that were
         -- matched by previous tweaks that have set them the "footnote-inpage" cr-hint,
@@ -1019,12 +1035,27 @@ This tweak can be duplicated as a user style tweak when books contain footnotes 
         -- to apply the hint).
         -- For the font-size changes, we want to match only block elements (with "-inline")
         -- as we want to keep any relative font-size (ie. 0.5em) for inline nodes like <sup>.
-        -- We also add a selector for the <autoBoxing> internal element (which are explicitely
+        -- We also add a selector for the <autoBoxing> internal element (which are explicitly
         -- not matched by '*') as we may get some in/as footnote containers, and they would
         -- inherit some of these properties, that we wish to reset too.
         (function()
             local sub_table = {
                 title = _("In-page footnote font size"),
+                {
+                    id = "inpage_footnote_font-size_smaller",
+                    conflicts_with = function(id) return util.stringStartsWith(id, "inpage_footnote_font-size_") end,
+                    title = _("Smaller footnotes (80%, legacy)"),
+                    description = _([[
+Decrease size of in-page footnotes. This may have no effect if it's overwritten by publisher styles. The "footnote font size" style tweaks are recommended instead.]]),
+                    css = [[
+*, autoBoxing {
+    -cr-hint: late;
+    -cr-only-if: -fb2-document inpage-footnote;
+        font-size: 0.8rem !important;
+}
+                    ]],
+                    separator = true,
+                },
             }
             for __, rem in ipairs( { 1.0, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65 } ) do
                 local pct = rem * 100
@@ -1121,7 +1152,7 @@ This will break any complex footnote containing quotes or lists.]]),
                 id = "inpage_footnote_regularize_text",
                 title = _("Regularize text size on inline elements"),
                 description = _([[
-If the footnote text uses variable or absolute font sizes, line height or vertical alignments, which would make it too irregular, you can reset all of them to get a leaner text (to the expense of loosing superscripts).]]),
+If the footnote text uses variable or absolute font sizes, line height or vertical alignments, which would make it too irregular, you can reset all of them to get a leaner text (to the expense of losing superscripts).]]),
                 priority = 6,
                 css = [[
 *, autoBoxing {

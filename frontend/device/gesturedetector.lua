@@ -61,6 +61,7 @@ local TAP_INTERVAL_MS = 0
 local DOUBLE_TAP_INTERVAL_MS = 300
 local TWO_FINGER_TAP_DURATION_MS = 300
 local HOLD_INTERVAL_MS = 500
+local LONG_HOLD_INTERVAL_S = 3 -- seconds
 local SWIPE_INTERVAL_MS = 900
 
 -- This is used as a singleton by Input (itself used as a singleton).
@@ -72,6 +73,7 @@ local GestureDetector = {
     DOUBLE_TAP_INTERVAL_MS = DOUBLE_TAP_INTERVAL_MS,
     TWO_FINGER_TAP_DURATION_MS = TWO_FINGER_TAP_DURATION_MS,
     HOLD_INTERVAL_MS = HOLD_INTERVAL_MS,
+    LONG_HOLD_INTERVAL_S = LONG_HOLD_INTERVAL_S,
     SWIPE_INTERVAL_MS = SWIPE_INTERVAL_MS,
     -- pinch/spread direction table
     DIRECTION_TABLE = { -- const
@@ -87,7 +89,7 @@ local GestureDetector = {
     -- Hash of our currently active contacts
     active_contacts = {},
     contact_count = 0,
-    -- Used for double tap and bounce detection (this is outside a Contact object because it requires minimal persistance).
+    -- Used for double tap and bounce detection (this is outside a Contact object because it requires minimal persistence).
     previous_tap = {},
     -- for timestamp clocksource detection
     clock_id = nil,
@@ -806,7 +808,7 @@ function Contact:voidState()
     if tev.id == -1 then
         if self.down and buddy_contact and buddy_contact.down and self.mt_gesture then
             -- If we were lifted before our buddy, and we're part of a MT gesture,
-            -- defer to the proper state (wthout switching state ourselves).
+            -- defer to the proper state (without switching state ourselves).
             if self.mt_gesture == "tap" then
                 return self:tapState()
             elseif self.mt_gesture == "swipe" or self.mt_gesture == "pan" or self.mt_gesture == "pan_release" then
@@ -1141,7 +1143,7 @@ function Contact:handleTwoFingerPan(buddy_contact)
                 ges_ev._end_pos = nil
             end
             ges_ev.direction = gesture_detector.DIRECTION_TABLE[tpan_dir]
-            -- Use the the sum of both contacts' travel for the distance
+            -- Use the sum of both contacts' travel for the distance
             ges_ev.distance = tpan_dis + rpan_dis
             -- Some handlers might also want to know the distance between the two contacts on lift & down.
             ges_ev.span = end_distance
@@ -1387,11 +1389,42 @@ local ges_coordinate_translation_90 = {
     southeast = "southwest",
     southwest = "northwest",
 }
-local function translateGesDirCoordinate(direction, translation_table)
-    return translation_table[direction]
-end
 local function translateMultiswipeGesDirCoordinate(multiswipe_directions, translation_table)
     return multiswipe_directions:gsub("%S+", translation_table)
+end
+
+function GestureDetector:translateCoordinates(ges, mode)
+    local translate
+    if mode == self.screen.DEVICE_ROTATED_CLOCKWISE then
+        -- 1
+        local width = self.screen:getWidth()
+        translate = function(geom)
+            if not geom then return end
+            geom.x, geom.y = (width - geom.y), (geom.x)
+        end
+    elseif mode == self.screen.DEVICE_ROTATED_COUNTER_CLOCKWISE then
+        -- 3
+        local height = self.screen:getHeight()
+        translate = function(geom)
+            if not geom then return end
+            geom.x, geom.y = (geom.y), (height - geom.x)
+        end
+    elseif mode == self.screen.DEVICE_ROTATED_UPSIDE_DOWN then
+        -- 2
+        local width = self.screen:getWidth()
+        local height = self.screen:getHeight()
+        translate = function(geom)
+            if not geom then return end
+            geom.x, geom.y = (width - geom.x), (height - geom.y)
+        end
+    else
+        -- 0
+        return
+    end
+
+    translate(ges.pos)
+    translate(ges.start_pos)
+    translate(ges.end_pos)
 end
 
 --[[--
@@ -1403,10 +1436,8 @@ end
 function GestureDetector:adjustGesCoordinate(ges)
     local mode = self.screen:getTouchRotation()
     if mode == self.screen.DEVICE_ROTATED_CLOCKWISE then
-        -- in landscape mode rotated 90
-        if ges.pos then
-            ges.pos.x, ges.pos.y = (self.screen:getWidth() - ges.pos.y), (ges.pos.x)
-        end
+        -- in landscape mode rotated 90 (1)
+        self:translateCoordinates(ges, mode)
         if ges.ges == "swipe" or ges.ges == "pan"
             or ges.ges == "hold_pan"
             or ges.ges == "multiswipe"
@@ -1414,7 +1445,7 @@ function GestureDetector:adjustGesCoordinate(ges)
             or ges.ges == "two_finger_pan"
             or ges.ges == "two_finger_hold_pan"
         then
-            ges.direction = translateGesDirCoordinate(ges.direction, ges_coordinate_translation_90)
+            ges.direction = ges_coordinate_translation_90[ges.direction]
             if ges.ges == "multiswipe" then
                 ges.multiswipe_directions = translateMultiswipeGesDirCoordinate(ges.multiswipe_directions, ges_coordinate_translation_90)
                 logger.dbg("GestureDetector: Landscape translation for multiswipe:", ges.multiswipe_directions)
@@ -1435,10 +1466,8 @@ function GestureDetector:adjustGesCoordinate(ges)
             logger.dbg("GestureDetector: Landscape translation for ges:", ges.ges, ges.direction)
         end
     elseif mode == self.screen.DEVICE_ROTATED_COUNTER_CLOCKWISE then
-        -- in landscape mode rotated 270
-        if ges.pos then
-            ges.pos.x, ges.pos.y = (ges.pos.y), (self.screen:getHeight() - ges.pos.x)
-        end
+        -- in landscape mode rotated 270 (3)
+        self:translateCoordinates(ges, mode)
         if ges.ges == "swipe" or ges.ges == "pan"
             or ges.ges == "hold_pan"
             or ges.ges == "multiswipe"
@@ -1446,7 +1475,7 @@ function GestureDetector:adjustGesCoordinate(ges)
             or ges.ges == "two_finger_pan"
             or ges.ges == "two_finger_hold_pan"
         then
-            ges.direction = translateGesDirCoordinate(ges.direction, ges_coordinate_translation_270)
+            ges.direction = ges_coordinate_translation_270[ges.direction]
             if ges.ges == "multiswipe" then
                 ges.multiswipe_directions = translateMultiswipeGesDirCoordinate(ges.multiswipe_directions, ges_coordinate_translation_270)
                 logger.dbg("GestureDetector: Inverted landscape translation for multiswipe:", ges.multiswipe_directions)
@@ -1467,10 +1496,8 @@ function GestureDetector:adjustGesCoordinate(ges)
             logger.dbg("GestureDetector: Inverted landscape translation for ges:", ges.ges, ges.direction)
         end
     elseif mode == self.screen.DEVICE_ROTATED_UPSIDE_DOWN then
-        -- in portrait mode rotated 180
-        if ges.pos then
-            ges.pos.x, ges.pos.y = (self.screen:getWidth() - ges.pos.x), (self.screen:getHeight() - ges.pos.y)
-        end
+        -- in portrait mode rotated 180 (2)
+        self:translateCoordinates(ges, mode)
         if ges.ges == "swipe" or ges.ges == "pan"
             or ges.ges == "hold_pan"
             or ges.ges == "multiswipe"
@@ -1478,7 +1505,7 @@ function GestureDetector:adjustGesCoordinate(ges)
             or ges.ges == "two_finger_pan"
             or ges.ges == "two_finger_hold_pan"
         then
-            ges.direction = translateGesDirCoordinate(ges.direction, ges_coordinate_translation_180)
+            ges.direction = ges_coordinate_translation_180[ges.direction]
             if ges.ges == "multiswipe" then
                 ges.multiswipe_directions = translateMultiswipeGesDirCoordinate(ges.multiswipe_directions, ges_coordinate_translation_180)
                 logger.dbg("GestureDetector: Inverted portrait translation for multiswipe:", ges.multiswipe_directions)

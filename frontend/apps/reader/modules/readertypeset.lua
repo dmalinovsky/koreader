@@ -75,10 +75,16 @@ function ReaderTypeset:onReadSettings(config)
     self:onSetPageMargins(self.unscaled_margins)
     self.sync_t_b_page_margins = self.configurable.sync_t_b_page_margins == 1 and true or false
 
-    -- default to disable TXT formatting as it does more harm than good (the setting is not in UI)
-    self.txt_preformatted = config:readSetting("txt_preformatted")
-                         or G_reader_settings:readSetting("txt_preformatted")
-                         or 1
+    if self.ui.document.is_txt then
+        -- default to no fancy detection and formatting, leave lines as is
+        self.txt_preformatted = config:readSetting("txt_preformatted")
+                             or G_reader_settings:readSetting("txt_preformatted")
+                             or 1
+    else
+        -- for other formats than txt, we should keep this setting fixed
+        -- or it could create multiple cache files
+        self.txt_preformatted = 1
+    end
     self.ui.document:setTxtPreFormatted(self.txt_preformatted)
 
     -- default to disable smooth scaling
@@ -86,6 +92,20 @@ function ReaderTypeset:onReadSettings(config)
 
     -- default to automagic nightmode-friendly handling of images
     self.ui.document:setNightmodeImages(self.configurable.nightmode_images == 1)
+end
+
+function ReaderTypeset:onReaderReady()
+    -- Initial detection of fb2 may be wrong
+    local doc_format = self.ui.document:getDocumentFormat()
+    local is_fb2 = doc_format:sub(1, 11) == "FictionBook"
+    if self.ui.document.is_fb2 ~= is_fb2 then
+        self.ui.document.is_fb2 = is_fb2
+        self.ui.document.default_css = is_fb2 and "./data/fb2.css" or "./data/epub.css"
+        if self.ui.document.is_new then
+            local css = G_reader_settings:readSetting(is_fb2 and "copt_fb2_css" or "copt_css")
+            self:setStyleSheet(css or self.ui.document.default_css)
+        end
+    end
 end
 
 function ReaderTypeset:onSaveSettings()
@@ -155,7 +175,7 @@ function ReaderTypeset:onSetRenderDPI(dpi)
 end
 
 -- June 2018: epub.css has been cleaned to be more conforming to HTML specs
--- and to not include class name based styles (with conditional compatiblity
+-- and to not include class name based styles (with conditional compatibility
 -- styles for previously opened documents). It should be usable on all
 -- HTML based documents, except FB2 which has some incompatible specs.
 -- These other css files have not been updated in the same way, and are
@@ -190,7 +210,7 @@ function ReaderTypeset:genStyleSheetMenu()
                 return css_file == self.css
             end,
             enabled_func = function()
-                if fb2_compatible == true and not self.ui.document.is_fb2 then
+                if fb2_compatible == true and not (self.ui.document.is_fb2 or self.ui.document.is_txt) then
                     return false
                 end
                 if fb2_compatible == false and self.ui.document.is_fb2 then
@@ -293,11 +313,39 @@ This stylesheet is to be used only with FB2 and FB3 documents, which are not cla
             end
             return text
         end,
-        sub_item_table = obsoleted_table,
         checked_func = function()
             return obsoleted_css[self.css] ~= nil
-        end
+        end,
+        sub_item_table = obsoleted_table,
+        separator = true,
     })
+    if self.ui.document.is_txt then
+        table.insert(style_table, {
+            text_func = function()
+                return _("Auto-detect TXT files layout") .. (G_reader_settings:has("txt_preformatted") and "   ★" or "")
+            end,
+            checked_func = function()
+                return self.txt_preformatted == 0
+            end,
+            callback = function()
+                self.txt_preformatted = self.txt_preformatted == 1 and 0 or 1
+                self.ui.doc_settings:saveSetting("txt_preformatted", self.txt_preformatted)
+                -- Calling document:setTxtPreFormatted() here could cause a segfault (there is something
+                -- really fishy about its handling, like bits of partial rerenderings happening while it is
+                -- disabled...). It's safer to just not notify crengine, and propose the user to reload the
+                -- document and restart from a sane state.
+                self.ui.rolling:showSuggestReloadConfirmBox()
+            end,
+            hold_callback = function(touchmenu_instance)
+                if G_reader_settings:has("txt_preformatted") then
+                    G_reader_settings:delSetting("txt_preformatted")
+                else
+                    G_reader_settings:saveSetting("txt_preformatted", 0)
+                end
+                touchmenu_instance:updateItems()
+            end,
+        })
+    end
     return style_table
 end
 
@@ -463,7 +511,11 @@ function ReaderTypeset:onSetPageTopAndBottomMargin(t_b_margins, when_applied_cal
 end
 
 function ReaderTypeset:onSyncPageTopBottomMargins(toggle, when_applied_callback)
-    self.sync_t_b_page_margins = not self.sync_t_b_page_margins
+    if toggle == nil then
+        self.sync_t_b_page_margins = not self.sync_t_b_page_margins
+    else
+        self.sync_t_b_page_margins = toggle
+    end
     if self.sync_t_b_page_margins then
         -- Adjust current top and bottom margins if needed
         if self.unscaled_margins[2] ~= self.unscaled_margins[4] then
@@ -506,13 +558,19 @@ function ReaderTypeset:onSetPageMargins(margins, when_applied_callback)
             text = T(_([[
 Margins set to:
 
-  left: %1 (%2px)
-  right: %3 (%4px)
-  top: %5 (%6px)
-  bottom: %7 (%8px)
+  left: %1
+  right: %2
+  top: %3
+  bottom: %4
+
+  footer: %5 px
 
 Tap to dismiss.]]),
-            margins[1], left, margins[3], right, margins[2], top, margins[4], bottom),
+            optionsutil.formatFlexSize(margins[1]),
+            optionsutil.formatFlexSize(margins[3]),
+            optionsutil.formatFlexSize(margins[2]),
+            optionsutil.formatFlexSize(margins[4]),
+            self.view.footer.reclaim_height and 0 or self.view.footer:getHeight()),
             dismiss_callback = when_applied_callback,
         })
     end
