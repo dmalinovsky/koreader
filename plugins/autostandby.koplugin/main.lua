@@ -95,6 +95,12 @@ function AutoStandby:_scheduleNext(t, config)
     -- Nuke past timer as we'll reschedule the allow (or not)
     UIManager:unschedule(AutoStandby.allow)
 
+    if not self:isAllowedByConfig() then
+        -- all standbys forbidden, always prevent
+        self:prevent()
+        return
+    end
+
     if PowerD:getCapacityHW() <= config.bat then
         -- battery is below threshold, so allow standby aggressively
         logger.dbg("AutoStandby: battery below threshold, enabling aggressive standby")
@@ -112,11 +118,7 @@ function AutoStandby:_scheduleNext(t, config)
 
     AutoStandby.lastInput = t
 
-    if not self:isAllowedByConfig() then
-        -- all standbys forbidden, always prevent
-        self:prevent()
-        return
-    elseif AutoStandby.delay == 0 then
+    if AutoStandby.delay == 0 then
         -- If delay is 0 now, just allow straight
         self:allow()
         return
